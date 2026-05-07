@@ -1,0 +1,271 @@
+/* ── Reset & Base ── */
+*, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+body {
+  background: #07071a;
+  color: #dde0ff;
+  font-family: 'Segoe UI', 'Hiragino Kaku Gothic ProN', sans-serif;
+  min-height: 100vh;
+}
+
+.hidden { display: none !important; }
+
+/* ── Header ── */
+header {
+  text-align: center;
+  padding: 1.8rem 1rem 1.2rem;
+  background: linear-gradient(180deg, #12073a 0%, transparent 100%);
+  border-bottom: 1px solid #1e1e4a;
+}
+header h1 {
+  font-size: 2.2rem;
+  font-weight: 900;
+  letter-spacing: .05em;
+  background: linear-gradient(90deg, #f472b6, #a78bfa, #60a5fa);
+  -webkit-background-clip: text;
+  -webkit-text-fill-color: transparent;
+  background-clip: text;
+}
+header p { color: #7070aa; margin-top: .4rem; font-size: .95rem; }
+
+/* ── Upload ── */
+#upload-section {
+  display: flex;
+  justify-content: center;
+  align-items: center;
+  padding: 5rem 1rem;
+}
+#drop-zone {
+  border: 2px dashed #3030aa;
+  border-radius: 20px;
+  padding: 3rem 4rem;
+  text-align: center;
+  cursor: pointer;
+  transition: all .25s;
+  background: #0e0e2a;
+  max-width: 480px;
+  width: 100%;
+  user-select: none;
+}
+#drop-zone:hover, #drop-zone.drag-over {
+  border-color: #a78bfa;
+  background: #16163a;
+  box-shadow: 0 0 40px rgba(167,139,250,.2);
+}
+.drop-icon { font-size: 4rem; margin-bottom: 1rem; }
+.drop-text { font-size: 1.2rem; font-weight: 700; margin-bottom: .4rem; }
+.drop-or   { color: #505090; margin: .5rem 0; font-size: .9rem; }
+.drop-formats { color: #404070; font-size: .75rem; margin-top: 1rem; }
+
+.file-btn {
+  display: inline-block;
+  padding: .7rem 2rem;
+  background: linear-gradient(135deg, #a78bfa, #6366f1);
+  color: #fff;
+  border-radius: 999px;
+  cursor: pointer;
+  font-size: .95rem;
+  font-weight: 700;
+  transition: transform .15s, box-shadow .15s;
+}
+.file-btn:hover {
+  transform: scale(1.05);
+  box-shadow: 0 6px 24px rgba(167,139,250,.5);
+}
+
+/* ── Analyzing ── */
+#analyzing-section {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  padding: 5rem 1rem;
+  gap: .6rem;
+}
+.spinner {
+  width: 56px; height: 56px;
+  border: 5px solid #1e1e4a;
+  border-top-color: #a78bfa;
+  border-radius: 50%;
+  animation: spin .9s linear infinite;
+  margin-bottom: 1rem;
+}
+@keyframes spin { to { transform: rotate(360deg); } }
+#analyze-title { font-size: 1.2rem; font-weight: 700; color: #a78bfa; }
+.analyze-sub { color: #606090; font-size: .85rem; }
+
+/* ── Karaoke section ── */
+#karaoke-section { padding: 1rem 1.5rem; max-width: 1100px; margin: 0 auto; }
+
+#song-bar {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  background: #0e0e2a;
+  border: 1px solid #1e1e4a;
+  border-radius: 10px;
+  padding: .65rem 1rem;
+  margin-bottom: .75rem;
+  font-size: .95rem;
+}
+#song-title { font-weight: 600; color: #c0c0ff; }
+#time-display { font-family: monospace; color: #7070aa; }
+
+/* ── Canvas ── */
+#canvas-wrap {
+  position: relative;
+  border-radius: 14px;
+  overflow: hidden;
+  border: 1px solid #1e1e4a;
+  background: #03030f;
+  margin-bottom: .75rem;
+  cursor: pointer;
+}
+#pitch-canvas { display: block; width: 100%; height: 400px; }
+
+/* ── Controls ── */
+#controls {
+  display: flex;
+  gap: .75rem;
+  align-items: center;
+  flex-wrap: wrap;
+  margin-bottom: .75rem;
+}
+.btn {
+  padding: .65rem 1.4rem;
+  border: 1px solid #3030aa;
+  background: #0e0e2a;
+  color: #c0c0ff;
+  border-radius: 999px;
+  cursor: pointer;
+  font-size: .9rem;
+  font-weight: 600;
+  transition: background .15s, border-color .15s;
+}
+.btn:hover { background: #1a1a3a; border-color: #a78bfa; }
+.btn.primary {
+  background: linear-gradient(135deg, #a78bfa, #6366f1);
+  border: none;
+  color: #fff;
+}
+.btn.primary:hover { box-shadow: 0 4px 20px rgba(167,139,250,.4); }
+.btn.mic-active { background: #0d2a0d; border-color: #22c55e; color: #22c55e; }
+
+#vol-wrap {
+  display: flex;
+  align-items: center;
+  gap: .4rem;
+  margin-left: auto;
+  color: #7070aa;
+  font-size: .85rem;
+}
+#volume { accent-color: #a78bfa; width: 100px; }
+
+/* ── HUD ── */
+#hud {
+  display: flex;
+  gap: .6rem;
+  flex-wrap: wrap;
+}
+#hud > div {
+  flex: 1;
+  min-width: 90px;
+  background: #0e0e2a;
+  border: 1px solid #1e1e4a;
+  border-radius: 12px;
+  padding: .8rem .5rem .5rem;
+  text-align: center;
+}
+.hud-label {
+  font-size: .68rem;
+  color: #505090;
+  margin-top: .3rem;
+  letter-spacing: .04em;
+  text-transform: uppercase;
+}
+
+#score-num {
+  font-size: 2rem;
+  font-weight: 900;
+  background: linear-gradient(90deg, #f472b6, #a78bfa);
+  -webkit-background-clip: text;
+  -webkit-text-fill-color: transparent;
+  background-clip: text;
+}
+#eval-text { font-size: 1.1rem; font-weight: 800; color: #facc15; min-height: 1.4em; }
+#accuracy-num { font-size: 1.3rem; font-weight: 700; color: #34d399; }
+#mic-note, #target-note { font-size: 1.3rem; font-weight: 700; color: #60a5fa; font-family: monospace; }
+
+/* ── Lyrics ── */
+#lyrics-section {
+  margin-top: .75rem;
+  background: #0a0a22;
+  border: 1px solid #1e1e4a;
+  border-radius: 14px;
+  padding: 1rem 1.5rem 1.2rem;
+  min-height: 130px;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: .2rem;
+}
+#lyrics-label {
+  font-size: .68rem;
+  color: #505090;
+  letter-spacing: .1em;
+  text-transform: uppercase;
+  margin-bottom: .4rem;
+  align-self: flex-start;
+}
+#lyrics-display {
+  width: 100%;
+  text-align: center;
+  display: flex;
+  flex-direction: column;
+  gap: .15rem;
+}
+.lyric-line {
+  font-size: 1rem;
+  line-height: 1.5;
+  transition: all .2s;
+  white-space: pre-wrap;
+}
+.lyric-active {
+  font-size: 1.55rem;
+  font-weight: 700;
+  color: #ffffff;
+  text-shadow: 0 0 20px rgba(167,139,250,.6);
+  min-height: 2.2rem;
+}
+.lyric-dim  { color: #50507a; font-size: .95rem; }
+.lyric-far  { color: #35355a; font-size: .85rem; }
+
+/* word-level highlighting */
+.word-sung    { color: #a78bfa; }
+.word-current {
+  color: #facc15;
+  text-shadow: 0 0 12px rgba(250,204,21,.7);
+  border-bottom: 2px solid #facc15;
+}
+.word-upcoming { color: #ffffff; }
+
+#lyrics-none {
+  color: #505090;
+  font-size: .85rem;
+  font-style: italic;
+}
+
+/* ── No pitch warning ── */
+#no-pitch-warning {
+  background: #2a1a0a;
+  border: 1px solid #7c2d12;
+  border-radius: 10px;
+  padding: .9rem 1rem;
+  color: #fdba74;
+  font-size: .85rem;
+  margin-top: .75rem;
+  text-align: center;
+}
+
+/* ── New song button ── */
+#new-song-wrap { text-align: center; padding: 1.2rem; }

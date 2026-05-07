@@ -1,0 +1,109 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>AI Karaoke - 音程バー自動生成</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+<div id="app">
+
+  <header>
+    <h1>AI Karaoke</h1>
+    <p>どんな曲でもカラオケに　―　AI が音程バーを自動生成</p>
+  </header>
+
+  <!-- ── Upload ── -->
+  <section id="upload-section">
+    <div id="drop-zone">
+      <div class="drop-icon">♪</div>
+      <div class="drop-text">音声ファイルをここにドロップ</div>
+      <div class="drop-or">または</div>
+      <label for="file-input" class="file-btn">ファイルを選択</label>
+      <input type="file" id="file-input" accept=".mp3,.wav,.ogg,.flac,.m4a,.aac" hidden>
+      <div class="drop-formats">MP3 / WAV / OGG / FLAC / M4A / AAC</div>
+    </div>
+  </section>
+
+  <!-- ── Analyzing ── -->
+  <section id="analyzing-section" class="hidden">
+    <div class="spinner"></div>
+    <div id="analyze-title">AIが音程を解析中...</div>
+    <div class="analyze-sub">pYINアルゴリズムでメロディを検出しています</div>
+    <div class="analyze-sub" id="analyze-hint">（3〜4分の曲で20〜40秒かかります）</div>
+  </section>
+
+  <!-- ── Karaoke ── -->
+  <section id="karaoke-section" class="hidden">
+
+    <div id="song-bar">
+      <span id="song-title">♪ 曲名</span>
+      <span id="time-display">0:00 / 0:00</span>
+    </div>
+
+    <div id="canvas-wrap">
+      <canvas id="pitch-canvas"></canvas>
+    </div>
+
+    <div id="controls">
+      <button id="mic-btn" class="btn">マイク ON</button>
+      <button id="play-btn" class="btn primary">▶ 再生</button>
+      <button id="reset-btn" class="btn">↩ リセット</button>
+      <div id="vol-wrap">
+        <span>音量</span>
+        <input type="range" id="volume" min="0" max="1" step="0.05" value="0.8">
+      </div>
+    </div>
+
+    <div id="hud">
+      <div id="score-box">
+        <div id="score-num">0</div>
+        <div class="hud-label">SCORE</div>
+      </div>
+      <div id="eval-box">
+        <div id="eval-text">—</div>
+        <div class="hud-label">評価</div>
+      </div>
+      <div id="accuracy-box">
+        <div id="accuracy-num">—</div>
+        <div class="hud-label">精度</div>
+      </div>
+      <div id="mic-pitch-box">
+        <div id="mic-note">—</div>
+        <div class="hud-label">あなたの音</div>
+      </div>
+      <div id="target-pitch-box">
+        <div id="target-note">—</div>
+        <div class="hud-label">目標の音</div>
+      </div>
+    </div>
+
+    <div id="no-pitch-warning" class="hidden">
+      メロディが検出されませんでした。インストゥルメンタル音源か、別の曲をお試しください。
+    </div>
+
+    <!-- ── Lyrics ── -->
+    <div id="lyrics-section" class="hidden">
+      <div id="lyrics-label">歌詞</div>
+      <div id="lyrics-display">
+        <div id="lyric-prev"  class="lyric-line lyric-dim"></div>
+        <div id="lyric-curr"  class="lyric-line lyric-active"></div>
+        <div id="lyric-next"  class="lyric-line lyric-dim"></div>
+        <div id="lyric-next2" class="lyric-line lyric-dim lyric-far"></div>
+      </div>
+      <div id="lyrics-none" class="hidden">歌詞が検出されませんでした（インスト曲の場合は正常です）</div>
+    </div>
+
+  </section>
+
+  <div id="new-song-wrap" class="hidden">
+    <button id="new-song-btn" class="btn">別の曲を選択</button>
+  </div>
+
+</div>
+
+<audio id="audio-player" preload="auto"></audio>
+<script src="app.js"></script>
+</body>
+</html>
