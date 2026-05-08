@@ -7,7 +7,10 @@ import tempfile
 import os
 import gc
 import re
+import difflib
+import unicodedata
 import traceback
+from collections import defaultdict
 import logging
 import threading
 import asyncio
@@ -271,22 +274,51 @@ async def fetch_lyrics(artist: str, title: str):
     return None, None
 
 
+
+def _uniform_segments(lines: list, t0: float, t1: float) -> list:
+    """均等時間分配フォールバック"""
+    n    = len(lines)
+    span = max(t1 - t0, 1.0)
+    out  = []
+    for i, line in enumerate(lines):
+        ts       = t0 + i       * span / n
+        te       = t0 + (i + 1) * span / n
+        words    = line.split()
+        nw       = len(words)
+        wd       = (te - ts) / nw if nw else (te - ts)
+        out.append({
+            'start': round(ts, 3),
+            'end':   round(te, 3),
+            'text':  line,
+            'words': [
+                {'start': round(ts + wi * wd, 3),
+                 'end':   round(ts + (wi+1) * wd, 3),
+                 'word':  (' ' + w) if wi > 0 else w}
+                for wi, w in enumerate(words)
+            ],
+        })
+    return out
+
+
 def align_lyrics(fetched_text: str, whisper_segments: list, audio_duration: float = 0.0) -> list:
     """
-    Whisper の発話区間を基準に、ネット取得の歌詞を均等に時間配分する。
+    Whisper の音声認識と、ネット取得の歌詞の一致部分をタイミングアンカーとして同期。
 
-    【なぜ単語比率マッピングをやめたか】
-    Whisper(小モデル)は曲の後半やアウトロを認識せず途中で止まることが多い。
-    単語数の比率でマッピングするとその短い区間に全歌詞が詰め込まれ「早すぎる」になる。
-    そのため、発話開始 〜 推定終了時刻 を行数で等分する均等分配を採用する。
+    手順:
+      1. Whisper 単語タイムスタンプを収集
+      2. Whisper テキスト ↔ ネット歌詞を【文字レベル】でシーケンスマッチング
+         (日本語は単語区切りがないため文字単位が有効)
+      3. 一致した文字の位置 → Whisper タイムスタンプ をアンカーとして記録
+      4. アンカー間・前後を線形補間・外挿
+      5. 行単位のセグメントに変換
+      ※ アンカーが 2 箇所未満の場合は均等分配にフォールバック
     """
     if not whisper_segments:
         return whisper_segments
 
-    # フェッチ歌詞のパース（空行・セクションマーカーを除去）
-    raw_lines = fetched_text.replace("\r\n", "\n").replace("\r", "\n").split("\n")
+    # フェッチ歌詞をパース（空行・セクションマーカーを除去）
     fetched_lines = []
-    for line in raw_lines:
+    for line in fetched_text.replace('\r\n', '\n').replace('\r', '\n').split('\n'):
         line = line.strip()
         if not line or re.match(r'^[\[【（(].+[\]】）)]$', line):
             continue
@@ -295,46 +327,141 @@ def align_lyrics(fetched_text: str, whisper_segments: list, audio_duration: floa
     if not fetched_lines:
         return whisper_segments
 
+    # 曲の時間範囲を決定
     song_start  = whisper_segments[0]['start']
     whisper_end = whisper_segments[-1]['end']
-
-    # Whisper が音声全体の 80% 未満しかカバーしていない場合は終端を補正する。
-    # (アウトロ・インスト等で Whisper が早期終了するケースへの対処)
     if audio_duration > 0 and whisper_end < audio_duration * 0.80:
-        song_end = audio_duration * 0.88   # 末尾 12% はアウトロと仮定
-        logger.info("アライメント: Whisper終端補正 %.1f→%.1f秒", whisper_end, song_end)
+        song_end = audio_duration * 0.88
+        logger.info("アライメント: 終端補正 %.1f→%.1f秒", whisper_end, song_end)
     else:
         song_end = whisper_end
 
-    n    = len(fetched_lines)
-    span = song_end - song_start
-    if span <= 0:
-        return whisper_segments
+    # Whisper 単語タイムスタンプを収集
+    whisper_words = []
+    for seg in whisper_segments:
+        for w in seg.get('words', []):
+            txt = w.get('word', '').strip()
+            if txt:
+                whisper_words.append({'text': txt, 'start': w['start'], 'end': w['end']})
+
+    # フェッチ歌詞の全単語をフラット化: (word, line_idx, word_idx_in_line)
+    flat_fetched = []
+    for li, line in enumerate(fetched_lines):
+        for wi, word in enumerate(line.split()):
+            flat_fetched.append((word, li, wi))
+
+    if not whisper_words or not flat_fetched:
+        return _uniform_segments(fetched_lines, song_start, song_end)
+
+    def norm(s: str) -> str:
+        """NFKC 正規化 → 記号除去 → 小文字化（英語・日本語共通）"""
+        return re.sub(r'[^\w]', '',
+                      unicodedata.normalize('NFKC', s), flags=re.UNICODE).lower()
+
+    # Whisper 文字ストリーム（各文字がどの Whisper 単語に属するか）
+    w_chars: list = []
+    w_char_to_word: list = []
+    for wi, ww in enumerate(whisper_words):
+        for ch in norm(ww['text']):
+            w_chars.append(ch)
+            w_char_to_word.append(wi)
+
+    # フェッチ歌詞 文字ストリーム（各文字がどの flat_fetched 単語に属するか）
+    f_chars: list = []
+    f_char_to_word: list = []
+    for fi, (word, li, wi_in_line) in enumerate(flat_fetched):
+        for ch in norm(word):
+            f_chars.append(ch)
+            f_char_to_word.append(fi)
+
+    # 文字レベルでシーケンスマッチング
+    matcher = difflib.SequenceMatcher(None, w_chars, f_chars, autojunk=False)
+
+    # タイミングマップ: flat_fetched_idx → (start, end)
+    timing_map: dict = {}
+    matched_chars = 0
+    for op, i1, i2, j1, j2 in matcher.get_opcodes():
+        if op == 'equal':
+            matched_chars += i2 - i1
+            for d in range(i2 - i1):
+                wi_word = w_char_to_word[i1 + d]
+                fi_word = f_char_to_word[j1 + d]
+                if fi_word not in timing_map:   # 単語の先頭文字でアンカーを確定
+                    timing_map[fi_word] = (
+                        whisper_words[wi_word]['start'],
+                        whisper_words[wi_word]['end'],
+                    )
+
+    match_ratio = matched_chars / max(len(f_chars), 1)
+    logger.info("アライメント: 文字マッチ率=%.1f%% (%d/%d文字, アンカー=%d箇所)",
+                match_ratio * 100, matched_chars, max(len(f_chars), 1), len(timing_map))
+
+    n_fetched = len(flat_fetched)
+    known     = sorted(timing_map)
+
+    # アンカーが 2 箇所未満 → 均等分配にフォールバック
+    if len(known) < 2:
+        logger.info("アライメント: アンカー不足(%d箇所)、均等分配に切替", len(known))
+        return _uniform_segments(fetched_lines, song_start, song_end)
+
+    # ── アンカー外・間を線形補間 ──────────────────────────────────────
+
+    # 先頭アンカー前を外挿
+    fa = known[0]
+    if fa > 0:
+        t0_anchor = timing_map[fa][0]
+        dur = min((t0_anchor - song_start) / fa if fa > 0 else 0.3, 2.0)
+        for fi in range(fa):
+            t = max(song_start, t0_anchor - (fa - fi) * dur)
+            timing_map[fi] = (round(t, 3), round(min(t + dur, t0_anchor), 3))
+
+    # アンカー間を線形補間
+    for a, b in zip(known, known[1:]):
+        if b - a <= 1:
+            continue
+        t_a  = timing_map[a][1]
+        t_b  = timing_map[b][0]
+        gap  = b - a
+        span = max(0.0, t_b - t_a)
+        for fi in range(a + 1, b):
+            frac = (fi - a) / gap
+            t    = t_a + frac * span
+            dur  = span / gap if gap else 0.0
+            timing_map[fi] = (round(t, 3), round(min(t + dur, t_b), 3))
+
+    # 末尾アンカー後を外挿
+    la = known[-1]
+    if la < n_fetched - 1:
+        _, t_last = timing_map[la]
+        remaining = n_fetched - 1 - la
+        span = max(song_end - t_last, remaining * 0.3)
+        dur  = span / remaining
+        for fi in range(la + 1, n_fetched):
+            t = t_last + (fi - la) * dur
+            timing_map[fi] = (round(t, 3), round(t + dur, 3))
+
+    # ── ライン単位でセグメントを構築 ──────────────────────────────────
+    by_line: dict = defaultdict(list)
+    for fi, (word, li, wi_in_line) in enumerate(flat_fetched):
+        if fi in timing_map:
+            s, e = timing_map[fi]
+            by_line[li].append({
+                'word':  (' ' + word) if wi_in_line > 0 else word,
+                'start': s,
+                'end':   e,
+            })
 
     result = []
-    for i, line in enumerate(fetched_lines):
-        t_s      = song_start + i       * span / n
-        t_e      = song_start + (i + 1) * span / n
-        words    = line.split()
-        n_w      = len(words)
-        word_dur = (t_e - t_s) / n_w if n_w else (t_e - t_s)
-        seg_words = [
-            {
-                'start': round(t_s + wi * word_dur, 3),
-                'end':   round(t_s + (wi + 1) * word_dur, 3),
-                'word':  (' ' + w) if wi > 0 else w,
-            }
-            for wi, w in enumerate(words)
-        ]
-        result.append({
-            'start': round(t_s, 3),
-            'end':   round(t_e, 3),
-            'text':  line,
-            'words': seg_words,
-        })
+    for li, line in enumerate(fetched_lines):
+        wds = by_line.get(li, [])
+        if wds:
+            result.append({
+                'start': wds[0]['start'],
+                'end':   wds[-1]['end'],
+                'text':  line,
+                'words': wds,
+            })
 
-    logger.info("アライメント完了: %d行, %.1f〜%.1f秒 (audio=%.1fs)",
-                n, song_start, song_end, audio_duration)
     return result
 
 
