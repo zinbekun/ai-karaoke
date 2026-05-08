@@ -4,3 +4,6 @@ python-multipart
 librosa
 numpy
 soundfile
+faster-whisper
+shazamio
+httpx

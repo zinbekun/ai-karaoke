@@ -118,13 +118,31 @@ async function loadFile(file) {
   karaokeSec.classList.remove('hidden');
   newSongWrap.classList.remove('hidden');
 
-  songTitleEl.textContent = '♪ ' + (analysisData.filename || file.name);
+  // 曲名表示（Shazam認識 or ファイル名）
+  if (analysisData.song_info) {
+    const { artist, title, source } = analysisData.song_info;
+    songTitleEl.textContent = '♪ ' + (artist ? artist + ' - ' : '') + title;
+  } else {
+    songTitleEl.textContent = '♪ ' + (analysisData.filename || file.name);
+  }
   noPitchWarn.classList.toggle('hidden', analysisData.segments.length > 0);
 
   // 歌詞セクション初期化
   const hasLyrics = analysisData.lyrics && analysisData.lyrics.length > 0;
   lyricsSec.classList.remove('hidden');
   lyricsNone.classList.toggle('hidden', hasLyrics);
+
+  // 歌詞ソースバッジ
+  const lyricsSourceEl = document.getElementById('lyrics-source');
+  if (lyricsSourceEl) {
+    if (analysisData.song_info && analysisData.song_info.source) {
+      lyricsSourceEl.textContent = 'ネット取得 (' + analysisData.song_info.source + ')';
+      lyricsSourceEl.className = 'lyrics-source-badge badge-net';
+    } else {
+      lyricsSourceEl.textContent = 'AI文字起こし';
+      lyricsSourceEl.className = 'lyrics-source-badge badge-ai';
+    }
+  }
   lyricPrev.textContent = lyricCurr.textContent = '';
   lyricNext.textContent = lyricNext2.textContent = '';
 

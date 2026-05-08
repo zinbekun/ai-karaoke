@@ -14,7 +14,8 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir numpy scipy && \
     pip install --no-cache-dir librosa soundfile && \
     pip install --no-cache-dir fastapi "uvicorn[standard]" python-multipart && \
-    pip install --no-cache-dir faster-whisper
+    pip install --no-cache-dir faster-whisper && \
+    pip install --no-cache-dir shazamio httpx
 
 COPY . .
 

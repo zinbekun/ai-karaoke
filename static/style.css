@@ -216,7 +216,20 @@ header p { color: #7070aa; margin-top: .4rem; font-size: .95rem; }
   text-transform: uppercase;
   margin-bottom: .4rem;
   align-self: flex-start;
+  display: flex;
+  align-items: center;
+  gap: .5rem;
 }
+.lyrics-source-badge {
+  font-size: .6rem;
+  padding: .1rem .45rem;
+  border-radius: 999px;
+  letter-spacing: .04em;
+  font-weight: 600;
+  text-transform: none;
+}
+.badge-net { background: #1e3a6a; color: #60a5fa; border: 1px solid #1e4a8a; }
+.badge-ai  { background: #2d1a4a; color: #a78bfa; border: 1px solid #4a2a7a; }
 #lyrics-display {
   width: 100%;
   text-align: center;
