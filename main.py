@@ -196,4 +196,31 @@ async def analyze_audio(file: UploadFile = File(...)):
             pass
 
 
+@app.get("/api/health")
+async def health():
+    import subprocess, shutil
+    ffmpeg_path = shutil.which("ffmpeg")
+    ffmpeg_ok = False
+    if ffmpeg_path:
+        try:
+            r = subprocess.run([ffmpeg_path, "-version"], capture_output=True, timeout=5)
+            ffmpeg_ok = r.returncode == 0
+        except Exception:
+            pass
+    return {
+        "status": "ok",
+        "ffmpeg_path": ffmpeg_path,
+        "ffmpeg_ok": ffmpeg_ok,
+        "whisper_model": WHISPER_MODEL,
+    }
+
+@app.get("/api/logs")
+async def get_logs():
+    try:
+        with open("server.log", encoding="utf-8") as f:
+            lines = f.readlines()
+        return {"logs": "".join(lines[-80:])}
+    except FileNotFoundError:
+        return {"logs": "(ログファイルなし)"}
+
 app.mount("/", StaticFiles(directory="static", html=True), name="static")
