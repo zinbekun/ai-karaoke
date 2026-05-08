@@ -590,52 +590,64 @@ function updateLyrics(currentTime) {
   const lyrics = analysisData && analysisData.lyrics;
   if (!lyrics || lyrics.length === 0) return;
 
-  // 現在のセグメントを探す（バイナリサーチっぽく線形で）
-  let idx = -1;
+  // 現在のセグメントを特定する。
+  // "end 時刻" ではなく "次の行の start 時刻" を切り替えの基準にすることで、
+  // end タイミングの誤差に依存しなくなる。
+  let newIdx = -(lyrics.length);  // 初期値: 全行がまだ先
   for (let i = 0; i < lyrics.length; i++) {
-    if (currentTime >= lyrics[i].start && currentTime <= lyrics[i].end + 0.1) {
-      idx = i;
+    if (currentTime < lyrics[i].start) {
+      newIdx = -(i + 1);  // i 番目がまだ先
       break;
     }
-    // まだ始まっていない最初のセグメントを「次」として表示
-    if (lyrics[i].start > currentTime) {
-      idx = -(i + 1);  // 負数 = 未来セグメントのインデックス
+    const nextStart = (i + 1 < lyrics.length) ? lyrics[i + 1].start : Infinity;
+    if (currentTime < nextStart) {
+      newIdx = i;          // 現在の行
       break;
     }
   }
 
-  // 変化がない場合はスキップ
-  const displayIdx = idx >= 0 ? idx : -(idx + 1);
-  if (displayIdx === lyricCurrIdx && idx === lyricCurrIdx) return;
-  lyricCurrIdx = idx;
+  const segChanged = (newIdx !== lyricCurrIdx);
 
-  if (idx >= 0) {
-    // 現在歌っているセグメント
-    const seg = lyrics[idx];
-    lyricPrev.textContent  = idx > 0 ? lyrics[idx - 1].text : '';
-    lyricNext.textContent  = idx < lyrics.length - 1 ? lyrics[idx + 1].text : '';
-    lyricNext2.textContent = idx < lyrics.length - 2 ? lyrics[idx + 2].text : '';
+  if (segChanged) {
+    lyricCurrIdx = newIdx;
 
-    // 単語レベルのハイライト
+    if (newIdx >= 0) {
+      // 行が切り替わった: prev / next を更新
+      lyricPrev.textContent  = newIdx > 0                   ? lyrics[newIdx - 1].text : '';
+      lyricNext.textContent  = newIdx < lyrics.length - 1   ? lyrics[newIdx + 1].text : '';
+      lyricNext2.textContent = newIdx < lyrics.length - 2   ? lyrics[newIdx + 2].text : '';
+      // words なしの場合はここでテキストをセット
+      if (!lyrics[newIdx].words || lyrics[newIdx].words.length === 0) {
+        lyricCurr.textContent = lyrics[newIdx].text;
+      }
+    } else {
+      // 行間（無音区間）
+      const ni = -(newIdx + 1);
+      lyricPrev.textContent  = ni > 0                 ? lyrics[ni - 1].text : '';
+      lyricCurr.textContent  = '';
+      lyricNext.textContent  = ni < lyrics.length     ? lyrics[ni].text : '';
+      lyricNext2.textContent = ni < lyrics.length - 1 ? lyrics[ni + 1].text : '';
+    }
+  }
+
+  // 現在行の単語ハイライトを毎フレーム更新
+  if (newIdx >= 0) {
+    const seg = lyrics[newIdx];
     if (seg.words && seg.words.length > 0) {
       let html = '';
-      for (const w of seg.words) {
-        const cls = currentTime >= w.end   ? 'word-sung'
-                  : currentTime >= w.start ? 'word-current'
-                  :                          'word-upcoming';
+      for (let wi = 0; wi < seg.words.length; wi++) {
+        const w         = seg.words[wi];
+        // 次の単語の start を "この単語が歌い終わった" 基準にする
+        const nextStart = wi + 1 < seg.words.length
+          ? seg.words[wi + 1].start
+          : (newIdx + 1 < lyrics.length ? lyrics[newIdx + 1].start : w.end);
+        const cls = currentTime >= nextStart  ? 'word-sung'
+                  : currentTime >= w.start    ? 'word-current'
+                  :                             'word-upcoming';
         html += `<span class="${cls}">${escHtml(w.word)}</span>`;
       }
       lyricCurr.innerHTML = html;
-    } else {
-      lyricCurr.textContent = seg.text;
     }
-  } else {
-    // セグメント間の無音区間
-    const nextIdx = -(idx + 1);
-    lyricPrev.textContent  = nextIdx > 0 ? lyrics[nextIdx - 1].text : '';
-    lyricCurr.textContent  = '';
-    lyricNext.textContent  = nextIdx < lyrics.length ? lyrics[nextIdx].text : '';
-    lyricNext2.textContent = nextIdx < lyrics.length - 1 ? lyrics[nextIdx + 1].text : '';
   }
 }
 

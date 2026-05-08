@@ -7,7 +7,6 @@ import tempfile
 import os
 import gc
 import re
-import difflib
 import traceback
 import logging
 import threading
@@ -274,133 +273,92 @@ async def fetch_lyrics(artist: str, title: str):
 
 def align_lyrics(fetched_text: str, whisper_segments: list) -> list:
     """
-    Whisper のセグメント単位のタイミングをアンカーとして、
-    ネット取得の正確な歌詞テキストを配置する。
+    Whisper の単語タイムスタンプを「位置比率」でフェッチ歌詞の各単語に割り当てる。
 
-    word-level matching ではなく segment-level matching を使うことで、
-    Whisper の聞き違いによるタイミングのズレを防ぐ。
+    テキストマッチングに依存しないため、Whisper の聞き違いや言語の違いに
+    関係なく安定して動作する。
+
+    原理: Whisper が N 単語を出力し、歌詞が M 単語あるとき、
+          歌詞の j 番目の単語は Whisper の (j * N / M) 番目の単語と
+          ほぼ同じ時刻に歌われていると仮定する。
     """
     if not whisper_segments:
         return whisper_segments
 
-    # 歌詞をパース（空行・セクションマーカーを除去）
+    # フェッチ歌詞のパース（空行・セクションマーカーを除去）
     raw_lines = fetched_text.replace("\r\n", "\n").replace("\r", "\n").split("\n")
     fetched_lines = []
     for line in raw_lines:
         line = line.strip()
         if not line:
             continue
-        # [Chorus] 【サビ】 (繰り返し) などのメタ行を除去
-        if re.match(r'^[\[【（(].+[\]】）)]$', line):
+        if re.match(r'^[\[【（(].+[\]】）)]$', line):  # [Chorus] 【サビ】 等
             continue
         fetched_lines.append(line)
 
     if not fetched_lines:
         return whisper_segments
 
-    def norm(s: str) -> str:
-        """句読点除去・小文字化（英語・日本語両対応）"""
-        return re.sub(r'[^\w\s]', '', s.lower(), flags=re.UNICODE).strip()
+    # Whisper 単語タイムスタンプを収集
+    ww = []  # [{start, end}, ...]
+    for seg in whisper_segments:
+        for w in seg.get('words', []):
+            if w.get('word', '').strip():
+                ww.append({'start': w['start'], 'end': w['end']})
 
-    w_norm = [norm(seg['text']) for seg in whisper_segments]
-    f_norm = [norm(line) for line in fetched_lines]
+    # word timestamps がない場合: セグメントを1点として使う
+    if not ww:
+        for seg in whisper_segments:
+            ww.append({'start': seg['start'], 'end': seg['end']})
 
-    # セグメント単位でシーケンスマッチング
-    matcher = difflib.SequenceMatcher(None, w_norm, f_norm, autojunk=False)
-    matched: dict = {}  # fetched_line_idx -> (start, end)
+    if not ww:
+        return whisper_segments
 
-    for op, i1, i2, j1, j2 in matcher.get_opcodes():
-        if op == 'equal':
-            for d in range(i2 - i1):
-                wseg = whisper_segments[i1 + d]
-                matched[j1 + d] = (wseg['start'], wseg['end'])
+    # フェッチ歌詞の全単語をフラット化: (word, line_idx, word_idx_in_line)
+    flat = []
+    for li, line in enumerate(fetched_lines):
+        for wi, word in enumerate(line.split()):
+            flat.append((word, li, wi))
 
-    total = len(fetched_lines)
-    n_w   = len(whisper_segments)
-    match_ratio = len(matched) / max(n_w, total, 1)
+    if not flat:
+        return whisper_segments
 
-    if match_ratio < 0.15:
-        # テキスト類似度が低い場合（言語違い等）→ 位置比率でセグメントを割り当て
-        logger.info("アライメント: 比率マッピングに切替 (match_ratio=%.2f)", match_ratio)
-        matched = {}
-        groups: dict = {}
-        for i in range(total):
-            w_idx = min(int(i * n_w / total), n_w - 1)
-            groups.setdefault(w_idx, []).append(i)
-        for w_idx, fi_list in groups.items():
-            wseg = whisper_segments[w_idx]
-            n = len(fi_list)
-            seg_dur = (wseg['end'] - wseg['start']) / n if n else 0
-            for k, fi in enumerate(fi_list):
-                t = wseg['start'] + k * seg_dur
-                matched[fi] = (round(t, 3), round(t + seg_dur, 3))
+    n_ww = len(ww)
+    n_fw = len(flat)
 
-    song_start = whisper_segments[0]['start']
-    song_end   = whisper_segments[-1]['end']
-    known = sorted(matched)
+    # 各フェッチ単語に Whisper タイムスタンプを線形補間で割り当て
+    from collections import defaultdict
+    by_line = defaultdict(list)
 
-    if not known:
-        # フォールバック: 均等分配
-        dur = (song_end - song_start) / total if total else 1.0
-        for i in range(total):
-            t = song_start + i * dur
-            matched[i] = (round(t, 3), round(t + dur, 3))
-        known = list(range(total))
-
-    # 未マッチ行を前後アンカーから補間
-    fa = known[0]
-    if fa > 0:
-        t0  = matched[fa][0]
-        dur = min(t0 / fa if fa else 0.5, 3.0)
-        for i in range(fa):
-            t = max(0.0, t0 - (fa - i) * dur)
-            matched[i] = (round(t, 3), round(t + dur, 3))
-
-    for a, b in zip(known, known[1:]):
-        if b - a <= 1:
-            continue
-        t_a_end   = matched[a][1]
-        t_b_start = matched[b][0]
-        gap  = b - a
-        span = max(0.0, t_b_start - t_a_end)
-        dur  = span / gap if gap else 0.0
-        for i in range(a + 1, b):
-            frac = (i - a) / gap
-            t    = t_a_end + frac * span
-            matched[i] = (round(t, 3), round(min(t + dur, t_b_start), 3))
-
-    la = known[-1]
-    if la < total - 1:
-        _, t_end  = matched[la]
-        remaining = total - 1 - la
-        span = max(song_end - t_end, remaining * 0.5)
-        dur  = span / remaining if remaining else 0.5
-        for i in range(la + 1, total):
-            t = t_end + (i - la) * dur
-            matched[i] = (round(t, 3), round(t + dur, 3))
-
-    # 各行のセグメントを構築（単語はセグメント時間内で均等分配）
-    result = []
-    for i, line in enumerate(fetched_lines):
-        s, e = matched.get(i, (song_start, song_end))
-        words    = line.split()
-        n        = len(words)
-        word_dur = (e - s) / n if n else (e - s)
-        seg_words = [
-            {
-                'start': round(s + wi * word_dur, 3),
-                'end':   round(s + (wi + 1) * word_dur, 3),
-                'word':  (' ' + w) if wi > 0 else w,
-            }
-            for wi, w in enumerate(words)
-        ]
-        result.append({
-            'start': round(s, 3),
-            'end':   round(e, 3),
-            'text':  line,
-            'words': seg_words,
+    for j, (word, li, wi) in enumerate(flat):
+        # 位置比率: 0.0 〜 n_ww-1 の実数インデックス
+        pos    = j * (n_ww - 1) / (n_fw - 1) if n_fw > 1 else 0.0
+        lo     = int(pos)
+        hi     = min(lo + 1, n_ww - 1)
+        frac   = pos - lo
+        ts = ww[lo]['start'] + frac * (ww[hi]['start'] - ww[lo]['start'])
+        te = ww[lo]['end']   + frac * (ww[hi]['end']   - ww[lo]['end'])
+        by_line[li].append({
+            'word':  (' ' + word) if wi > 0 else word,
+            'start': round(ts, 3),
+            'end':   round(te, 3),
         })
 
+    # ライン単位でセグメントを構築
+    result = []
+    for li, line in enumerate(fetched_lines):
+        words_in_line = by_line.get(li, [])
+        if not words_in_line:
+            continue
+        result.append({
+            'start': words_in_line[0]['start'],
+            'end':   words_in_line[-1]['end'],
+            'text':  line,
+            'words': words_in_line,
+        })
+
+    logger.info("アライメント完了: whisper_words=%d, lyrics_words=%d, lines=%d",
+                n_ww, n_fw, len(result))
     return result
 
 
