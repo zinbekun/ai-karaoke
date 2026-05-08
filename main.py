@@ -449,7 +449,15 @@ def align_lyrics(fetched_text: str, whisper_segments: list, audio_duration: floa
     logger.info("アライメント: 単語マッチ率=%.1f%% (アンカー=%d, ボーカル区間=%d個 計%.1fs)",
                 match_ratio * 100, len(timing_map), len(voiced), total_vocal)
 
-    known = sorted(timing_map)
+    known_raw = sorted(timing_map)
+    # アンカーのWhisperタイムスタンプが単調増加になるようフィルタ（逆転防止）
+    known = []
+    last_end = -1.0
+    for k in known_raw:
+        t_s, t_e = timing_map[k]
+        if t_s >= last_end - 0.05:
+            known.append(k)
+            last_end = t_e
 
     if len(known) < 2:
         logger.info("アライメント: アンカー不足→ボーカル区間内均等分配")
@@ -482,7 +490,8 @@ def align_lyrics(fetched_text: str, whisper_segments: list, audio_duration: floa
         vt_a = _abs_to_vt(t_a, voiced)
         vt_b = _abs_to_vt(t_b, voiced)
         gap     = b - a
-        vt_span = max(0.0, vt_b - vt_a)
+        # 最低でも1ワード0.2s相当のボーカル時間を保証（圧縮防止）
+        vt_span = max(vt_b - vt_a, gap * 0.2)
         for fi in range(a + 1, b):
             frac    = (fi - a) / gap
             frac_nx = (fi - a + 1) / gap
@@ -490,7 +499,7 @@ def align_lyrics(fetched_text: str, whisper_segments: list, audio_duration: floa
             vt_nx   = vt_a + frac_nx * vt_span
             timing_map[fi] = (
                 round(_vt_to_abs(vt, voiced), 3),
-                round(_vt_to_abs(min(vt_nx, vt_b), voiced), 3),
+                round(_vt_to_abs(vt_nx, voiced), 3),
             )
 
     # 末尾アンカー後（ボーカル時間軸で外挿）
@@ -529,6 +538,12 @@ def align_lyrics(fetched_text: str, whisper_segments: list, audio_duration: floa
                 'text':  line,
                 'words': wds,
             })
+
+    # ライン単位の最低表示間隔を保証（高速切替防止）
+    MIN_LINE_GAP = 0.6
+    for i in range(1, len(result)):
+        if result[i]['start'] < result[i - 1]['start'] + MIN_LINE_GAP:
+            result[i]['start'] = round(result[i - 1]['start'] + MIN_LINE_GAP, 3)
 
     return result
 
