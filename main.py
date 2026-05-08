@@ -187,19 +187,16 @@ async def analyze_audio(file: UploadFile = File(...)):
     try:
         logger.info("解析開始: %s", file.filename)
 
-        # 音程解析と歌詞文字起こしを並列実行
-        with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
-            pitch_future  = pool.submit(do_pitch, tmp_path)
-            lyrics_future = pool.submit(do_transcribe, tmp_path)
+        logger.info("音程解析中...")
+        pitch_data = do_pitch(tmp_path)
 
-            pitch_data = pitch_future.result()
-
-            try:
-                lyrics = lyrics_future.result()
-                logger.info("歌詞セグメント数: %d", len(lyrics))
-            except Exception as e:
-                logger.warning("歌詞文字起こし失敗 (スキップ): %s", e)
-                lyrics = []
+        logger.info("歌詞文字起こし中...")
+        try:
+            lyrics = do_transcribe(tmp_path)
+            logger.info("歌詞セグメント数: %d", len(lyrics))
+        except Exception as e:
+            logger.warning("歌詞文字起こし失敗 (スキップ): %s", e)
+            lyrics = []
 
         logger.info("解析完了: duration=%.1fs, segments=%d, lyrics=%d",
                     pitch_data["duration"], len(pitch_data["segments"]), len(lyrics))
