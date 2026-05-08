@@ -338,22 +338,19 @@ def _uniform_segments(lines: list, t0: float, t1: float) -> list:
     return out
 
 
+
 def align_lyrics(fetched_text: str, whisper_segments: list, audio_duration: float = 0.0) -> list:
     """
-    Whisper の音声認識（VAD）で得たボーカル区間を軸に、
-    ネット取得の歌詞テキストをタイムスタンプに同期させる。
-
-    ポイント:
-      - 補間を「絶対時間軸」ではなく「ボーカル累積時間軸」で行う
-        → ボーカルのないギャップ（伴奏区間）中に歌詞が進まない
-      - Whisper テキスト ↔ ネット歌詞を文字レベルでマッチング（日本語対応）
-      - 一致箇所をアンカーとして確定し、アンカー間をボーカル時間軸で補間
-      - アンカー不足時はボーカル区間内均等分配にフォールバック
+    Whisper セグメント（フレーズ単位）とネット歌詞行を類似度マッチングし、
+    正確なタイムスタンプで歌詞行を同期させる。
+    - セグメントレベルマッチング（単語レベルより安定）
+    - 伴奏区間ではボーカル累積時間軸で補間（歌詞が進まない）
+    - 最低 0.8s/行 を保証（高速切替防止）
     """
     if not whisper_segments:
         return whisper_segments
 
-    # フェッチ歌詞のパース（空行・セクションマーカーを除去）
+    # フェッチ歌詞のパース
     fetched_lines = []
     for line in fetched_text.replace('\r\n', '\n').replace('\r', '\n').split('\n'):
         line = line.strip()
@@ -364,7 +361,7 @@ def align_lyrics(fetched_text: str, whisper_segments: list, audio_duration: floa
     if not fetched_lines:
         return whisper_segments
 
-    # 曲の時間範囲（Whisper 終端補正）
+    # 曲の時間範囲
     song_start  = whisper_segments[0]['start']
     whisper_end = whisper_segments[-1]['end']
     if audio_duration > 0 and whisper_end < audio_duration * 0.80:
@@ -373,177 +370,145 @@ def align_lyrics(fetched_text: str, whisper_segments: list, audio_duration: floa
     else:
         song_end = whisper_end
 
-    # ボーカル区間を構築（小ギャップ < 2s は結合）
-    # Whisper の VAD 出力（各セグメント）をそのまま利用
+    # ボーカル区間
     voiced      = _merge_segs(whisper_segments, gap=2.0)
     total_vocal = sum(s['end'] - s['start'] for s in voiced)
+    n_lines     = len(fetched_lines)
 
-    # Whisper 単語タイムスタンプを収集
-    whisper_words = []
-    for seg in whisper_segments:
-        for w in seg.get('words', []):
-            txt = w.get('word', '').strip()
-            if txt:
-                whisper_words.append({'text': txt, 'start': w['start'], 'end': w['end']})
-
-    # フェッチ歌詞の全単語をフラット化
-    flat_fetched = []
-    for li, line in enumerate(fetched_lines):
-        for wi, word in enumerate(line.split()):
-            flat_fetched.append((word, li, wi))
-
-    n_fetched = len(flat_fetched)
-
-    def norm(s: str) -> str:
+    def norm_text(s: str) -> str:
         return re.sub(r'[^\w]', '', unicodedata.normalize('NFKC', s), flags=re.UNICODE).lower()
 
+    def make_words(line: str, t_s: float, t_e: float) -> list:
+        words = line.split()
+        nw = len(words)
+        wd = (t_e - t_s) / nw if nw > 0 else max(t_e - t_s, 0.3)
+        return [
+            {'start': round(t_s + wi * wd, 3),
+             'end':   round(t_s + (wi + 1) * wd, 3),
+             'word':  (' ' + w) if wi > 0 else w}
+            for wi, w in enumerate(words)
+        ]
+
     def vocal_uniform() -> list:
-        """ボーカル区間内に均等分配するフォールバック"""
         result = []
-        n = len(fetched_lines)
         for i, line in enumerate(fetched_lines):
-            vts = i       * total_vocal / n
-            vte = (i + 1) * total_vocal / n
+            vts = i       * total_vocal / n_lines
+            vte = (i + 1) * total_vocal / n_lines
             ts  = _vt_to_abs(vts, voiced)
             te  = _vt_to_abs(vte, voiced)
-            words = line.split()
-            nw    = len(words)
-            wd    = (te - ts) / nw if nw else (te - ts)
             result.append({
-                'start': round(ts, 3),
-                'end':   round(te, 3),
-                'text':  line,
-                'words': [
-                    {'start': round(ts + wi * wd, 3),
-                     'end':   round(ts + (wi+1) * wd, 3),
-                     'word':  (' ' + w) if wi > 0 else w}
-                    for wi, w in enumerate(words)
-                ],
+                'start': round(ts, 3), 'end': round(te, 3),
+                'text': line, 'words': make_words(line, ts, te),
             })
         return result
 
-    if not whisper_words or not flat_fetched or total_vocal <= 0:
+    if total_vocal <= 0:
         return _uniform_segments(fetched_lines, song_start, song_end)
 
-    # ── 単語レベルシーケンスマッチング ──────────────────────────────────
-    w_norms = [norm(w['text']) for w in whisper_words]
-    f_norms = [norm(word) for word, li, wi_in_line in flat_fetched]
+    # ── Stage 1: Whisper セグメント ↔ 歌詞行 マッチング ──────────────────
+    # 各 Whisper セグメントのテキストを正規化
+    seg_norms  = [norm_text(seg['text']) for seg in whisper_segments]
+    line_norms = [norm_text(line) for line in fetched_lines]
 
-    matcher = difflib.SequenceMatcher(None, w_norms, f_norms, autojunk=False)
+    # 前から順番に（単調増加制約）ベスト一致セグメントを探す
+    line_timing: dict = {}   # li → (start, end)
+    last_si = -1
+    for li, ln in enumerate(line_norms):
+        if not ln:
+            continue
+        best_score = 0.25   # 最低類似度閾値
+        best_si    = -1
+        for si in range(last_si + 1, len(whisper_segments)):
+            sn = seg_norms[si]
+            if not sn:
+                continue
+            score = difflib.SequenceMatcher(None, sn, ln).ratio()
+            if score > best_score:
+                best_score = score
+                best_si    = si
+        if best_si >= 0:
+            last_si = best_si
+            seg = whisper_segments[best_si]
+            line_timing[li] = (round(seg['start'], 3), round(seg['end'], 3))
 
-    timing_map: dict = {}
-    matched_words = 0
-    for op, i1, i2, j1, j2 in matcher.get_opcodes():
-        if op == 'equal':
-            for d in range(i2 - i1):
-                wi = i1 + d
-                fi = j1 + d
-                if w_norms[wi] and fi not in timing_map:
-                    timing_map[fi] = (
-                        whisper_words[wi]['start'],
-                        whisper_words[wi]['end'],
-                    )
-            matched_words += i2 - i1
+    logger.info("アライメント: ラインマッチ %d/%d (ボーカル区間=%d個 計%.1fs)",
+                len(line_timing), n_lines, len(voiced), total_vocal)
 
-    match_ratio = matched_words / max(n_fetched, 1)
-    logger.info("アライメント: 単語マッチ率=%.1f%% (アンカー=%d, ボーカル区間=%d個 計%.1fs)",
-                match_ratio * 100, len(timing_map), len(voiced), total_vocal)
-
-    known_raw = sorted(timing_map)
-    # アンカーのWhisperタイムスタンプが単調増加になるようフィルタ（逆転防止）
-    known = []
-    last_end = -1.0
-    for k in known_raw:
-        t_s, t_e = timing_map[k]
-        if t_s >= last_end - 0.05:
-            known.append(k)
-            last_end = t_e
-
-    if len(known) < 2:
-        logger.info("アライメント: アンカー不足→ボーカル区間内均等分配")
+    matched_lis = sorted(line_timing)
+    if not matched_lis:
+        logger.info("アライメント: マッチなし→ボーカル均等分配")
         return vocal_uniform()
 
-    # ── ボーカル時間軸で補間（伴奏ギャップをスキップ） ─────────────────
+    # ── Stage 2: 未マッチ行をボーカル時間軸で補間 ────────────────────────
+    all_timing: dict = {}
 
-    # 先頭アンカー前
-    fa = known[0]
-    if fa > 0:
-        t0_a      = timing_map[fa][0]
-        vt_start  = _abs_to_vt(song_start, voiced)
-        vt_anchor = _abs_to_vt(t0_a, voiced)
-        vt_span   = max(0.0, vt_anchor - vt_start)
-        dur_vt    = vt_span / fa if fa > 0 else 0.3
-        for fi in range(fa):
-            vt  = vt_start + fi * dur_vt
-            vte = min(vt + dur_vt, vt_anchor)
-            timing_map[fi] = (
-                round(_vt_to_abs(vt, voiced), 3),
-                round(_vt_to_abs(vte, voiced), 3),
-            )
-
-    # アンカー間をボーカル時間軸で線形補間
-    for a, b in zip(known, known[1:]):
-        if b - a <= 1:
-            continue
-        t_a  = timing_map[a][1]
-        t_b  = timing_map[b][0]
-        vt_a = _abs_to_vt(t_a, voiced)
-        vt_b = _abs_to_vt(t_b, voiced)
-        gap     = b - a
-        # 最低でも1ワード0.2s相当のボーカル時間を保証（圧縮防止）
-        vt_span = max(vt_b - vt_a, gap * 0.2)
-        for fi in range(a + 1, b):
-            frac    = (fi - a) / gap
-            frac_nx = (fi - a + 1) / gap
-            vt      = vt_a + frac    * vt_span
-            vt_nx   = vt_a + frac_nx * vt_span
-            timing_map[fi] = (
-                round(_vt_to_abs(vt, voiced), 3),
-                round(_vt_to_abs(vt_nx, voiced), 3),
-            )
-
-    # 末尾アンカー後（ボーカル時間軸で外挿）
-    la = known[-1]
-    if la < n_fetched - 1:
-        _, t_last = timing_map[la]
-        vt_last = _abs_to_vt(t_last, voiced)
-        remaining = n_fetched - 1 - la
-        vt_avail = max(total_vocal - vt_last, remaining * 0.5)
-        vt_dur = vt_avail / remaining
-        for fi in range(la + 1, n_fetched):
-            vt = vt_last + (fi - la) * vt_dur
-            timing_map[fi] = (
+    # 先頭マッチ前
+    first_li = matched_lis[0]
+    if first_li > 0:
+        vt_anchor = _abs_to_vt(line_timing[first_li][0], voiced)
+        vt_dur    = vt_anchor / first_li if first_li > 0 else 0.4
+        for li in range(first_li):
+            vt = li * vt_dur
+            all_timing[li] = (
                 round(_vt_to_abs(vt, voiced), 3),
                 round(_vt_to_abs(vt + vt_dur, voiced), 3),
             )
 
-    # ── ライン単位でセグメントを構築 ────────────────────────────────────
-    by_line: dict = defaultdict(list)
-    for fi, (word, li, wi_in_line) in enumerate(flat_fetched):
-        if fi in timing_map:
-            s, e = timing_map[fi]
-            by_line[li].append({
-                'word':  (' ' + word) if wi_in_line > 0 else word,
-                'start': s,
-                'end':   e,
-            })
+    # マッチ行
+    for li in matched_lis:
+        all_timing[li] = line_timing[li]
 
+    # マッチ間補間
+    for a_li, b_li in zip(matched_lis, matched_lis[1:]):
+        if b_li - a_li <= 1:
+            continue
+        t_a  = line_timing[a_li][1]
+        t_b  = line_timing[b_li][0]
+        vt_a = _abs_to_vt(t_a, voiced)
+        vt_b = _abs_to_vt(t_b, voiced)
+        gap     = b_li - a_li
+        vt_span = max(vt_b - vt_a, gap * 0.4)   # 最低 0.4s/行
+        for li in range(a_li + 1, b_li):
+            frac = (li - a_li) / gap
+            vt   = vt_a + frac * vt_span
+            all_timing[li] = (
+                round(_vt_to_abs(vt, voiced), 3),
+                round(_vt_to_abs(vt + vt_span / gap, voiced), 3),
+            )
+
+    # 末尾マッチ後
+    last_li = matched_lis[-1]
+    if last_li < n_lines - 1:
+        _, t_last = line_timing[last_li]
+        vt_last   = _abs_to_vt(t_last, voiced)
+        remaining = n_lines - 1 - last_li
+        vt_avail  = max(total_vocal - vt_last, remaining * 0.5)
+        vt_dur    = vt_avail / remaining
+        for li in range(last_li + 1, n_lines):
+            vt = vt_last + (li - last_li) * vt_dur
+            all_timing[li] = (
+                round(_vt_to_abs(vt, voiced), 3),
+                round(_vt_to_abs(vt + vt_dur, voiced), 3),
+            )
+
+    # ── Stage 3: 結果を構築 ────────────────────────────────────────────────
     result = []
     for li, line in enumerate(fetched_lines):
-        wds = by_line.get(li, [])
-        if wds:
-            result.append({
-                'start': wds[0]['start'],
-                'end':   wds[-1]['end'],
-                'text':  line,
-                'words': wds,
-            })
+        if li not in all_timing:
+            continue
+        t_s, t_e = all_timing[li]
+        result.append({
+            'start': t_s,
+            'end':   t_e,
+            'text':  line,
+            'words': make_words(line, t_s, t_e),
+        })
 
-    # ライン単位の最低表示間隔を保証（高速切替防止）
-    MIN_LINE_GAP = 0.6
+    # 最低 0.8s/行 を保証（高速切替の最終安全弁）
+    MIN_GAP = 0.8
     for i in range(1, len(result)):
-        if result[i]['start'] < result[i - 1]['start'] + MIN_LINE_GAP:
-            result[i]['start'] = round(result[i - 1]['start'] + MIN_LINE_GAP, 3)
+        if result[i]['start'] < result[i - 1]['start'] + MIN_GAP:
+            result[i]['start'] = round(result[i - 1]['start'] + MIN_GAP, 3)
 
     return result
 
