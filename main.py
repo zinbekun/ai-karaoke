@@ -425,37 +425,28 @@ def align_lyrics(fetched_text: str, whisper_segments: list, audio_duration: floa
     if not whisper_words or not flat_fetched or total_vocal <= 0:
         return _uniform_segments(fetched_lines, song_start, song_end)
 
-    # ── 文字レベルシーケンスマッチング ──────────────────────────────────
-    w_chars, w_ctw = [], []
-    for wi, ww in enumerate(whisper_words):
-        for ch in norm(ww['text']):
-            w_chars.append(ch)
-            w_ctw.append(wi)
+    # ── 単語レベルシーケンスマッチング ──────────────────────────────────
+    w_norms = [norm(w['text']) for w in whisper_words]
+    f_norms = [norm(word) for word, li, wi_in_line in flat_fetched]
 
-    f_chars, f_ctw = [], []
-    for fi, (word, li, wi_in_line) in enumerate(flat_fetched):
-        for ch in norm(word):
-            f_chars.append(ch)
-            f_ctw.append(fi)
-
-    matcher = difflib.SequenceMatcher(None, w_chars, f_chars, autojunk=False)
+    matcher = difflib.SequenceMatcher(None, w_norms, f_norms, autojunk=False)
 
     timing_map: dict = {}
-    matched_chars = 0
+    matched_words = 0
     for op, i1, i2, j1, j2 in matcher.get_opcodes():
         if op == 'equal':
-            matched_chars += i2 - i1
             for d in range(i2 - i1):
-                wi_word = w_ctw[i1 + d]
-                fi_word = f_ctw[j1 + d]
-                if fi_word not in timing_map:
-                    timing_map[fi_word] = (
-                        whisper_words[wi_word]['start'],
-                        whisper_words[wi_word]['end'],
+                wi = i1 + d
+                fi = j1 + d
+                if w_norms[wi] and fi not in timing_map:
+                    timing_map[fi] = (
+                        whisper_words[wi]['start'],
+                        whisper_words[wi]['end'],
                     )
+            matched_words += i2 - i1
 
-    match_ratio = matched_chars / max(len(f_chars), 1)
-    logger.info("アライメント: 文字マッチ率=%.1f%% (アンカー=%d, ボーカル区間=%d個 計%.1fs)",
+    match_ratio = matched_words / max(n_fetched, 1)
+    logger.info("アライメント: 単語マッチ率=%.1f%% (アンカー=%d, ボーカル区間=%d個 計%.1fs)",
                 match_ratio * 100, len(timing_map), len(voiced), total_vocal)
 
     known = sorted(timing_map)
@@ -502,17 +493,20 @@ def align_lyrics(fetched_text: str, whisper_segments: list, audio_duration: floa
                 round(_vt_to_abs(min(vt_nx, vt_b), voiced), 3),
             )
 
-    # 末尾アンカー後（song_end まで絶対時間で均等分配）
+    # 末尾アンカー後（ボーカル時間軸で外挿）
     la = known[-1]
     if la < n_fetched - 1:
         _, t_last = timing_map[la]
+        vt_last = _abs_to_vt(t_last, voiced)
         remaining = n_fetched - 1 - la
-        avail = max(song_end - t_last, remaining * 0.5)
-        dur = avail / remaining
+        vt_avail = max(total_vocal - vt_last, remaining * 0.5)
+        vt_dur = vt_avail / remaining
         for fi in range(la + 1, n_fetched):
-            ts = round(t_last + (fi - la) * dur, 3)
-            te = round(t_last + (fi - la + 1) * dur, 3)
-            timing_map[fi] = (ts, te)
+            vt = vt_last + (fi - la) * vt_dur
+            timing_map[fi] = (
+                round(_vt_to_abs(vt, voiced), 3),
+                round(_vt_to_abs(vt + vt_dur, voiced), 3),
+            )
 
     # ── ライン単位でセグメントを構築 ────────────────────────────────────
     by_line: dict = defaultdict(list)
