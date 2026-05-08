@@ -297,7 +297,7 @@ def _vt_to_abs(vt: float, voiced: list) -> float:
         if rem <= d:
             return seg['start'] + rem
         rem -= d
-    return voiced[-1]['end'] if voiced else vt
+    return (voiced[-1]['end'] + rem) if voiced else vt
 
 
 def _abs_to_vt(t: float, voiced: list) -> float:
@@ -502,20 +502,17 @@ def align_lyrics(fetched_text: str, whisper_segments: list, audio_duration: floa
                 round(_vt_to_abs(min(vt_nx, vt_b), voiced), 3),
             )
 
-    # 末尾アンカー後（残りのボーカル時間で外挿）
+    # 末尾アンカー後（song_end まで絶対時間で均等分配）
     la = known[-1]
     if la < n_fetched - 1:
-        _, t_last   = timing_map[la]
-        vt_last     = _abs_to_vt(t_last, voiced)
-        remaining   = n_fetched - 1 - la
-        vt_remain   = max(total_vocal - vt_last, remaining * 0.3)
-        vt_dur      = vt_remain / remaining
+        _, t_last = timing_map[la]
+        remaining = n_fetched - 1 - la
+        avail = max(song_end - t_last, remaining * 0.5)
+        dur = avail / remaining
         for fi in range(la + 1, n_fetched):
-            vt  = vt_last + (fi - la) * vt_dur
-            timing_map[fi] = (
-                round(_vt_to_abs(vt, voiced), 3),
-                round(_vt_to_abs(vt + vt_dur, voiced), 3),
-            )
+            ts = round(t_last + (fi - la) * dur, 3)
+            te = round(t_last + (fi - la + 1) * dur, 3)
+            timing_map[fi] = (ts, te)
 
     # ── ライン単位でセグメントを構築 ────────────────────────────────────
     by_line: dict = defaultdict(list)
