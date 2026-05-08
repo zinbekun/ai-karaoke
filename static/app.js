@@ -350,8 +350,7 @@ function loop() {
   drawCanvas(t, target);
   updateHUD(target, currentMidi);
 
-  // 歌詞は毎フレーム更新（DOMは変化があった時だけ書き換え）
-  if (frameIdx % 3 === 0) updateLyrics(t);
+  if (frameIdx % 2 === 0) updateLyrics(t);
 }
 
 // ── Scoring ────────────────────────────────────────────────────────────────

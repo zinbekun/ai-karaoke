@@ -271,16 +271,14 @@ async def fetch_lyrics(artist: str, title: str):
     return None, None
 
 
-def align_lyrics(fetched_text: str, whisper_segments: list) -> list:
+def align_lyrics(fetched_text: str, whisper_segments: list, audio_duration: float = 0.0) -> list:
     """
-    Whisper の単語タイムスタンプを「位置比率」でフェッチ歌詞の各単語に割り当てる。
+    Whisper の発話区間を基準に、ネット取得の歌詞を均等に時間配分する。
 
-    テキストマッチングに依存しないため、Whisper の聞き違いや言語の違いに
-    関係なく安定して動作する。
-
-    原理: Whisper が N 単語を出力し、歌詞が M 単語あるとき、
-          歌詞の j 番目の単語は Whisper の (j * N / M) 番目の単語と
-          ほぼ同じ時刻に歌われていると仮定する。
+    【なぜ単語比率マッピングをやめたか】
+    Whisper(小モデル)は曲の後半やアウトロを認識せず途中で止まることが多い。
+    単語数の比率でマッピングするとその短い区間に全歌詞が詰め込まれ「早すぎる」になる。
+    そのため、発話開始 〜 推定終了時刻 を行数で等分する均等分配を採用する。
     """
     if not whisper_segments:
         return whisper_segments
@@ -290,75 +288,53 @@ def align_lyrics(fetched_text: str, whisper_segments: list) -> list:
     fetched_lines = []
     for line in raw_lines:
         line = line.strip()
-        if not line:
-            continue
-        if re.match(r'^[\[【（(].+[\]】）)]$', line):  # [Chorus] 【サビ】 等
+        if not line or re.match(r'^[\[【（(].+[\]】）)]$', line):
             continue
         fetched_lines.append(line)
 
     if not fetched_lines:
         return whisper_segments
 
-    # Whisper 単語タイムスタンプを収集
-    ww = []  # [{start, end}, ...]
-    for seg in whisper_segments:
-        for w in seg.get('words', []):
-            if w.get('word', '').strip():
-                ww.append({'start': w['start'], 'end': w['end']})
+    song_start  = whisper_segments[0]['start']
+    whisper_end = whisper_segments[-1]['end']
 
-    # word timestamps がない場合: セグメントを1点として使う
-    if not ww:
-        for seg in whisper_segments:
-            ww.append({'start': seg['start'], 'end': seg['end']})
+    # Whisper が音声全体の 80% 未満しかカバーしていない場合は終端を補正する。
+    # (アウトロ・インスト等で Whisper が早期終了するケースへの対処)
+    if audio_duration > 0 and whisper_end < audio_duration * 0.80:
+        song_end = audio_duration * 0.88   # 末尾 12% はアウトロと仮定
+        logger.info("アライメント: Whisper終端補正 %.1f→%.1f秒", whisper_end, song_end)
+    else:
+        song_end = whisper_end
 
-    if not ww:
+    n    = len(fetched_lines)
+    span = song_end - song_start
+    if span <= 0:
         return whisper_segments
 
-    # フェッチ歌詞の全単語をフラット化: (word, line_idx, word_idx_in_line)
-    flat = []
-    for li, line in enumerate(fetched_lines):
-        for wi, word in enumerate(line.split()):
-            flat.append((word, li, wi))
-
-    if not flat:
-        return whisper_segments
-
-    n_ww = len(ww)
-    n_fw = len(flat)
-
-    # 各フェッチ単語に Whisper タイムスタンプを線形補間で割り当て
-    from collections import defaultdict
-    by_line = defaultdict(list)
-
-    for j, (word, li, wi) in enumerate(flat):
-        # 位置比率: 0.0 〜 n_ww-1 の実数インデックス
-        pos    = j * (n_ww - 1) / (n_fw - 1) if n_fw > 1 else 0.0
-        lo     = int(pos)
-        hi     = min(lo + 1, n_ww - 1)
-        frac   = pos - lo
-        ts = ww[lo]['start'] + frac * (ww[hi]['start'] - ww[lo]['start'])
-        te = ww[lo]['end']   + frac * (ww[hi]['end']   - ww[lo]['end'])
-        by_line[li].append({
-            'word':  (' ' + word) if wi > 0 else word,
-            'start': round(ts, 3),
-            'end':   round(te, 3),
-        })
-
-    # ライン単位でセグメントを構築
     result = []
-    for li, line in enumerate(fetched_lines):
-        words_in_line = by_line.get(li, [])
-        if not words_in_line:
-            continue
+    for i, line in enumerate(fetched_lines):
+        t_s      = song_start + i       * span / n
+        t_e      = song_start + (i + 1) * span / n
+        words    = line.split()
+        n_w      = len(words)
+        word_dur = (t_e - t_s) / n_w if n_w else (t_e - t_s)
+        seg_words = [
+            {
+                'start': round(t_s + wi * word_dur, 3),
+                'end':   round(t_s + (wi + 1) * word_dur, 3),
+                'word':  (' ' + w) if wi > 0 else w,
+            }
+            for wi, w in enumerate(words)
+        ]
         result.append({
-            'start': words_in_line[0]['start'],
-            'end':   words_in_line[-1]['end'],
+            'start': round(t_s, 3),
+            'end':   round(t_e, 3),
             'text':  line,
-            'words': words_in_line,
+            'words': seg_words,
         })
 
-    logger.info("アライメント完了: whisper_words=%d, lyrics_words=%d, lines=%d",
-                n_ww, n_fw, len(result))
+    logger.info("アライメント完了: %d行, %.1f〜%.1f秒 (audio=%.1fs)",
+                n, song_start, song_end, audio_duration)
     return result
 
 
@@ -409,8 +385,7 @@ async def analyze_audio(file: UploadFile = File(...)):
         # Step 4: 歌詞アライメント（ネット歌詞 + Whisperタイミング）
         if fetched_lyrics and lyrics:
             try:
-                lyrics = align_lyrics(fetched_lyrics, lyrics)
-                logger.info("アライメント完了: %dセグメント (source=%s)", len(lyrics), lyrics_source)
+                lyrics = align_lyrics(fetched_lyrics, lyrics, pitch_data['duration'])
             except Exception as e:
                 logger.warning("アライメント失敗（Whisper歌詞を使用）: %s", e)
                 lyrics_source = None
