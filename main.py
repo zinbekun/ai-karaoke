@@ -50,9 +50,36 @@ def get_whisper_model():
     return _whisper_model
 
 
+def convert_to_wav(src: str) -> str:
+    """ffmpegで任意フォーマットをWAVに変換（soundfileで確実に読める形式へ）"""
+    import shutil, subprocess
+    dst = src + "_converted.wav"
+    ffmpeg = shutil.which("ffmpeg") or "ffmpeg"
+    subprocess.run(
+        [ffmpeg, "-y", "-i", src,
+         "-ar", "22050", "-ac", "1", "-f", "wav", dst],
+        check=True, capture_output=True, timeout=120
+    )
+    return dst
+
+
 def do_pitch(audio_path: str) -> dict:
     """音程解析 (pYIN)"""
-    y, sr = librosa.load(audio_path, sr=22050, mono=True, duration=MAX_DURATION)
+    # M4A/AACなどはffmpegで先にWAVへ変換してからsoundfileで読む
+    ext = os.path.splitext(audio_path)[1].lower()
+    wav_path = None
+    if ext not in {".wav", ".flac", ".ogg"}:
+        logger.info("WAVに変換中: %s", ext)
+        wav_path = convert_to_wav(audio_path)
+        load_path = wav_path
+    else:
+        load_path = audio_path
+
+    try:
+        y, sr = librosa.load(load_path, sr=22050, mono=True, duration=MAX_DURATION)
+    finally:
+        if wav_path and os.path.exists(wav_path):
+            os.unlink(wav_path)
     duration = float(librosa.get_duration(y=y, sr=sr))
     hop_length = 512
 
