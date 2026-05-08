@@ -340,14 +340,12 @@ def _uniform_segments(lines: list, t0: float, t1: float) -> list:
 
 
 
+
 def align_lyrics(fetched_text: str, whisper_segments: list, audio_duration: float = 0.0) -> list:
     """
-    Whisper セグメントとネット歌詞行を類似度マッチング後、
-    未マッチ行を「曲の平均テンポ」で補間する。
-
-    - アンカー行（Whisper マッチ済み）は絶対に時刻を変更しない
-    - MIN_GAP カスケードはアンカーで遮断 → 「止まり→高速」バグを防ぐ
-    - 時間が足りないゾーンは超過行をスキップし次アンカーへ正確にジャンプ
+    2フェーズ設計:
+      Phase1: vocal_uniform で安定ベースラインを確立（高速切替/フリーズなし保証）
+      Phase2: セグメントマッチで精度向上（圧縮を生まないアンカーのみ採用）
     """
     if not whisper_segments:
         return whisper_segments
@@ -376,8 +374,7 @@ def align_lyrics(fetched_text: str, whisper_segments: list, audio_duration: floa
     if total_vocal <= 0:
         return _uniform_segments(fetched_lines, song_start, song_end)
 
-    # 曲の平均テンポ（1行あたりのボーカル累積時間）
-    ideal_vt = total_vocal / n_lines
+    ideal_vt = total_vocal / n_lines   # 1行あたりの理想ボーカル時間
 
     def norm_text(s: str) -> str:
         return re.sub(r'[^\w]', '', unicodedata.normalize('NFKC', s), flags=re.UNICODE).lower()
@@ -393,16 +390,29 @@ def align_lyrics(fetched_text: str, whisper_segments: list, audio_duration: floa
             for wi, w in enumerate(words)
         ]
 
-    # ── セグメントレベル類似度マッチング（前向き貪欲法）────────────────────
+    def vt_to_seg(li: int) -> float:
+        """行インデックス → ボーカル累積時間（vocal_uniform 位置）"""
+        return li * ideal_vt
+
+    # ── Phase 1: vocal_uniform ベースライン ──────────────────────────────
+    # ベースラインは常に正しく（圧縮なし・フリーズなし）
+    base = []
+    for i in range(n_lines):
+        vts = i * ideal_vt
+        vte = (i + 1) * ideal_vt
+        base.append((_vt_to_abs(vts, voiced), _vt_to_abs(vte, voiced)))
+
+    # ── Phase 2: セグメントマッチングで精度向上 ───────────────────────────
     seg_norms  = [norm_text(seg['text']) for seg in whisper_segments]
     line_norms = [norm_text(line) for line in fetched_lines]
 
-    line_timing: dict = {}
+    # 前向き貪欲マッチング（類似度閾値 0.4 以上）
+    raw_matches: dict = {}   # li → (t_s, t_e)
     last_si = -1
     for li, ln in enumerate(line_norms):
         if not ln:
             continue
-        best_score, best_si = 0.25, -1
+        best_score, best_si = 0.4, -1
         for si in range(last_si + 1, len(whisper_segments)):
             sn = seg_norms[si]
             if not sn:
@@ -413,90 +423,86 @@ def align_lyrics(fetched_text: str, whisper_segments: list, audio_duration: floa
         if best_si >= 0:
             last_si = best_si
             seg = whisper_segments[best_si]
-            line_timing[li] = (round(seg['start'], 3), round(seg['end'], 3))
+            raw_matches[li] = (round(seg['start'], 3), round(seg['end'], 3))
 
-    matched_lis = sorted(line_timing)
-    matched_set = set(matched_lis)
+    # アンカーフィルタ: 中間行に十分なボーカル時間がないアンカーを除外
+    # （圧縮を防ぎ、高速切替の根本原因を排除）
+    anchors: list = []   # [(li, vt_start, vt_end)]
+    prev_li      = -1
+    prev_vt_end  = 0.0
 
-    logger.info("アライメント: ラインマッチ %d/%d (ボーカル区間=%d個 計%.1fs)",
-                len(line_timing), n_lines, len(voiced), total_vocal)
+    for li in sorted(raw_matches):
+        t_s, t_e = raw_matches[li]
+        vt_s = _abs_to_vt(t_s, voiced)
+        n_between = li - prev_li - 1        # このアンカーまでの中間行数
+        vt_needed = n_between * ideal_vt    # 中間行に必要なボーカル時間
+        if vt_s - prev_vt_end >= vt_needed:
+            anchors.append((li, vt_s, _abs_to_vt(t_e, voiced)))
+            prev_li     = li
+            prev_vt_end = _abs_to_vt(t_e, voiced)
 
-    # ── ゾーン補間 ────────────────────────────────────────────────────────
+    logger.info("アライメント: マッチ %d→フィルタ後 %d / %d行",
+                len(raw_matches), len(anchors), n_lines)
+
+    if not anchors:
+        # マッチなし → ベースライン（vocal_uniform）をそのまま返す
+        result = []
+        for li, line in enumerate(fetched_lines):
+            t_s, t_e = base[li]
+            result.append({'start': round(t_s, 3), 'end': round(t_e, 3),
+                           'text': line, 'words': make_words(line, t_s, t_e)})
+        return result
+
+    # ── ゾーン補間: アンカー境界にボーカル時間を等分配 ────────────────────
+    # 境界アンカー（ li=-1, vt=0 ）と（ li=n_lines, vt=total_vocal ）を追加
+    bounds = [(-1, 0.0, 0.0)] + anchors + [(n_lines, total_vocal, total_vocal)]
+
     all_timing: dict = {}
 
-    def fill_zone(li_s: int, li_e: int, vt_s: float, vt_e: float):
-        """[li_s, li_e) の行を ideal_vt ペースで [vt_s, vt_e) に配置。
-        ゾーン内で時間が尽きたら残りの行はスキップ（テンポ維持優先）。"""
-        if li_e <= li_s or vt_e <= vt_s:
-            return
-        for i in range(li_e - li_s):
-            vt = vt_s + i * ideal_vt
-            if vt >= vt_e:      # 時間切れ→残りスキップ
-                break
-            all_timing[li_s + i] = (
-                round(_vt_to_abs(vt, voiced), 3),
-                round(_vt_to_abs(min(vt + ideal_vt, vt_e), voiced), 3),
-            )
+    for k in range(len(bounds) - 1):
+        a_li, _, a_vt_e = bounds[k]
+        b_li, b_vt_s, b_vt_e = bounds[k + 1]
 
-    if not matched_lis:
-        # マッチなし → 全体を均等配分
-        fill_zone(0, n_lines, 0.0, total_vocal)
-    else:
-        first_li = matched_lis[0]
-        last_li  = matched_lis[-1]
+        # このゾーンの中間行
+        zone_lis = list(range(a_li + 1, b_li))
+        n_zone   = len(zone_lis)
 
-        # 先頭マッチ前
-        if first_li > 0:
-            fill_zone(0, first_li, 0.0, _abs_to_vt(line_timing[first_li][0], voiced))
-
-        # マッチ行
-        for li in matched_lis:
-            all_timing[li] = line_timing[li]
-
-        # マッチ間
-        for a_li, b_li in zip(matched_lis, matched_lis[1:]):
-            if b_li > a_li + 1:
-                vt_a = _abs_to_vt(line_timing[a_li][1], voiced)
-                vt_b = _abs_to_vt(line_timing[b_li][0], voiced)
-                fill_zone(a_li + 1, b_li, vt_a, vt_b)
-
-        # 末尾マッチ後（total_vocal を超えてよい：線形外挿で延長）
-        if last_li < n_lines - 1:
-            _, t_last = line_timing[last_li]
-            vt_last = _abs_to_vt(t_last, voiced)
-            for i in range(n_lines - last_li - 1):
-                vt = vt_last + i * ideal_vt
-                all_timing[last_li + 1 + i] = (
+        if n_zone > 0:
+            vt_avail = max(0.0, b_vt_s - a_vt_e)
+            # アンカー間ゾーンはフィルタにより vt_avail >= n_zone * ideal_vt が保証済み
+            # 末尾ゾーンのみ不足する可能性があるため最低 0.5 * ideal_vt を保証
+            vt_pl = max(vt_avail / n_zone, ideal_vt * 0.5)
+            for i, li in enumerate(zone_lis):
+                vt = a_vt_e + i * vt_pl
+                all_timing[li] = (
                     round(_vt_to_abs(vt, voiced), 3),
-                    round(_vt_to_abs(vt + ideal_vt, voiced), 3),
+                    round(_vt_to_abs(vt + vt_pl, voiced), 3),
                 )
 
-    # ── 結果を構築 ────────────────────────────────────────────────────────
-    result      = []
-    result_li   = []          # 各 result[i] に対応する li
-    for li in range(n_lines):
-        if li not in all_timing:
-            continue
-        t_s, t_e = all_timing[li]
-        result.append({
-            'start': t_s,
-            'end':   t_e,
-            'text':  fetched_lines[li],
-            'words': make_words(fetched_lines[li], t_s, t_e),
-        })
-        result_li.append(li)
+        # アンカー行自体（b_li が n_lines の境界アンカーでなければ）
+        if 0 <= b_li < n_lines:
+            t_s, t_e = raw_matches[b_li]
+            all_timing[b_li] = (t_s, t_e)
 
-    # ── MIN_GAP：アンカー行は変更しない（カスケード遮断） ─────────────────
-    MIN_GAP    = 0.8
-    prev_start = -999.0
-    for i, li in enumerate(result_li):
-        if li in matched_set:
-            # アンカー：時刻を保持し、前回基準をリセット
-            prev_start = result[i]['start']
+    # ── 結果を構築 ────────────────────────────────────────────────────────
+    result = []
+    anchor_lis = {a[0] for a in anchors}
+    for li, line in enumerate(fetched_lines):
+        if li in all_timing:
+            t_s, t_e = all_timing[li]
         else:
-            if result[i]['start'] < prev_start + MIN_GAP:
-                result[i]['start'] = round(prev_start + MIN_GAP, 3)
-            prev_start = result[i]['start']
+            t_s, t_e = base[li]   # フォールバック（通常は到達しない）
+        result.append({
+            'start': round(t_s, 3),
+            'end':   round(t_e, 3),
+            'text':  line,
+            'words': make_words(line, t_s, t_e),
+        })
+
+    # 単調増加を保証（安全弁）
+    for i in range(1, len(result)):
+        if result[i]['start'] <= result[i - 1]['start']:
+            result[i]['start'] = round(result[i - 1]['start'] + ideal_vt * 0.5, 3)
 
     return result
 
