@@ -272,119 +272,136 @@ async def fetch_lyrics(artist: str, title: str):
     return None, None
 
 
-def _norm_word(w: str) -> str:
-    return re.sub(r'[^\w]', '', w, flags=re.UNICODE).lower()
-
-
 def align_lyrics(fetched_text: str, whisper_segments: list) -> list:
     """
-    ネット取得の正確な歌詞テキストをWhisperの単語タイムスタンプに合わせる。
-    SequenceMatcherでマッチングし、未マッチ部分は線形補間。
+    Whisper のセグメント単位のタイミングをアンカーとして、
+    ネット取得の正確な歌詞テキストを配置する。
+
+    word-level matching ではなく segment-level matching を使うことで、
+    Whisper の聞き違いによるタイミングのズレを防ぐ。
     """
-    # Whisper全単語を収集
-    whisper_words = []
-    for seg in whisper_segments:
-        for w in seg.get("words", []):
-            text = w.get("word", "").strip()
-            if text:
-                whisper_words.append({"word": text, "start": w["start"], "end": w["end"]})
-
-    if not whisper_words:
+    if not whisper_segments:
         return whisper_segments
 
-    # 歌詞を行ごとに分割
+    # 歌詞をパース（空行・セクションマーカーを除去）
     raw_lines = fetched_text.replace("\r\n", "\n").replace("\r", "\n").split("\n")
-    lines = [line.strip().split() for line in raw_lines if line.strip()]
-    if not lines:
+    fetched_lines = []
+    for line in raw_lines:
+        line = line.strip()
+        if not line:
+            continue
+        # [Chorus] 【サビ】 (繰り返し) などのメタ行を除去
+        if re.match(r'^[\[【（(].+[\]】）)]$', line):
+            continue
+        fetched_lines.append(line)
+
+    if not fetched_lines:
         return whisper_segments
 
-    # フラット化: (単語, 行インデックス)
-    flat = [(w, li) for li, lw in enumerate(lines) for w in lw]
-    if not flat:
-        return whisper_segments
+    def norm(s: str) -> str:
+        """句読点除去・小文字化（英語・日本語両対応）"""
+        return re.sub(r'[^\w\s]', '', s.lower(), flags=re.UNICODE).strip()
 
-    # シーケンスマッチング
-    w_norm = [_norm_word(w["word"]) for w in whisper_words]
-    f_norm = [_norm_word(fw[0]) for fw in flat]
+    w_norm = [norm(seg['text']) for seg in whisper_segments]
+    f_norm = [norm(line) for line in fetched_lines]
+
+    # セグメント単位でシーケンスマッチング
     matcher = difflib.SequenceMatcher(None, w_norm, f_norm, autojunk=False)
+    matched: dict = {}  # fetched_line_idx -> (start, end)
 
-    # タイミングマップ: flat_idx -> (start, end)
-    timing: dict = {}
     for op, i1, i2, j1, j2 in matcher.get_opcodes():
-        if op == "equal":
+        if op == 'equal':
             for d in range(i2 - i1):
-                ww = whisper_words[i1 + d]
-                timing[j1 + d] = (ww["start"], ww["end"])
+                wseg = whisper_segments[i1 + d]
+                matched[j1 + d] = (wseg['start'], wseg['end'])
 
-    total      = len(flat)
-    song_start = whisper_words[0]["start"]
-    song_end   = whisper_words[-1]["end"]
-    known      = sorted(timing)
+    total = len(fetched_lines)
+    n_w   = len(whisper_segments)
+    match_ratio = len(matched) / max(n_w, total, 1)
+
+    if match_ratio < 0.15:
+        # テキスト類似度が低い場合（言語違い等）→ 位置比率でセグメントを割り当て
+        logger.info("アライメント: 比率マッピングに切替 (match_ratio=%.2f)", match_ratio)
+        matched = {}
+        groups: dict = {}
+        for i in range(total):
+            w_idx = min(int(i * n_w / total), n_w - 1)
+            groups.setdefault(w_idx, []).append(i)
+        for w_idx, fi_list in groups.items():
+            wseg = whisper_segments[w_idx]
+            n = len(fi_list)
+            seg_dur = (wseg['end'] - wseg['start']) / n if n else 0
+            for k, fi in enumerate(fi_list):
+                t = wseg['start'] + k * seg_dur
+                matched[fi] = (round(t, 3), round(t + seg_dur, 3))
+
+    song_start = whisper_segments[0]['start']
+    song_end   = whisper_segments[-1]['end']
+    known = sorted(matched)
 
     if not known:
-        # マッチなし → 均等分配
+        # フォールバック: 均等分配
         dur = (song_end - song_start) / total if total else 1.0
-        for fi in range(total):
-            t = song_start + fi * dur
-            timing[fi] = (round(t, 3), round(t + dur, 3))
-    else:
-        # 先頭アンカー前
-        fa = known[0]
-        if fa > 0:
-            t0  = timing[fa][0]
-            dur = min(t0 / fa if fa else 0.3, 0.5)
-            for fi in range(fa):
-                t = max(0.0, t0 - (fa - fi) * dur)
-                timing[fi] = (round(t, 3), round(t + dur, 3))
+        for i in range(total):
+            t = song_start + i * dur
+            matched[i] = (round(t, 3), round(t + dur, 3))
+        known = list(range(total))
 
-        # アンカー間を補間
-        for a, b in zip(known, known[1:]):
-            if b - a <= 1:
-                continue
-            ta_end   = timing[a][1]
-            tb_start = timing[b][0]
-            gap  = b - a
-            span = max(0.0, tb_start - ta_end)
-            for fi in range(a + 1, b):
-                frac = (fi - a) / gap
-                t    = ta_end + frac * span
-                dur  = max(0.05, span / gap)
-                timing[fi] = (round(t, 3), round(min(t + dur, tb_start), 3))
+    # 未マッチ行を前後アンカーから補間
+    fa = known[0]
+    if fa > 0:
+        t0  = matched[fa][0]
+        dur = min(t0 / fa if fa else 0.5, 3.0)
+        for i in range(fa):
+            t = max(0.0, t0 - (fa - i) * dur)
+            matched[i] = (round(t, 3), round(t + dur, 3))
 
-        # 末尾アンカー後
-        la = known[-1]
-        if la < total - 1:
-            _, t_end  = timing[la]
-            remaining = total - 1 - la
-            dur = min(max(song_end - t_end, remaining * 0.3) / remaining, 0.5)
-            for fi in range(la + 1, total):
-                t = t_end + (fi - la) * dur
-                timing[fi] = (round(t, 3), round(t + dur, 3))
+    for a, b in zip(known, known[1:]):
+        if b - a <= 1:
+            continue
+        t_a_end   = matched[a][1]
+        t_b_start = matched[b][0]
+        gap  = b - a
+        span = max(0.0, t_b_start - t_a_end)
+        dur  = span / gap if gap else 0.0
+        for i in range(a + 1, b):
+            frac = (i - a) / gap
+            t    = t_a_end + frac * span
+            matched[i] = (round(t, 3), round(min(t + dur, t_b_start), 3))
 
-    # 行ごとにセグメントを再構成
-    segments = []
-    fi_off = 0
-    for li, lwords in enumerate(lines):
-        seg_words = []
-        for wi, word in enumerate(lwords):
-            fi = fi_off + wi
-            if fi in timing:
-                s, e = timing[fi]
-                seg_words.append({
-                    "start": s,
-                    "end":   e,
-                    "word":  (" " + word) if wi > 0 else word,
-                })
-        fi_off += len(lwords)
-        if seg_words:
-            segments.append({
-                "start": seg_words[0]["start"],
-                "end":   seg_words[-1]["end"],
-                "text":  " ".join(lwords),
-                "words": seg_words,
-            })
+    la = known[-1]
+    if la < total - 1:
+        _, t_end  = matched[la]
+        remaining = total - 1 - la
+        span = max(song_end - t_end, remaining * 0.5)
+        dur  = span / remaining if remaining else 0.5
+        for i in range(la + 1, total):
+            t = t_end + (i - la) * dur
+            matched[i] = (round(t, 3), round(t + dur, 3))
 
-    return segments
+    # 各行のセグメントを構築（単語はセグメント時間内で均等分配）
+    result = []
+    for i, line in enumerate(fetched_lines):
+        s, e = matched.get(i, (song_start, song_end))
+        words    = line.split()
+        n        = len(words)
+        word_dur = (e - s) / n if n else (e - s)
+        seg_words = [
+            {
+                'start': round(s + wi * word_dur, 3),
+                'end':   round(s + (wi + 1) * word_dur, 3),
+                'word':  (' ' + w) if wi > 0 else w,
+            }
+            for wi, w in enumerate(words)
+        ]
+        result.append({
+            'start': round(s, 3),
+            'end':   round(e, 3),
+            'text':  line,
+            'words': seg_words,
+        })
+
+    return result
 
 
 @app.post("/api/analyze")
