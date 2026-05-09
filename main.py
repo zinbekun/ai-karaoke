@@ -65,16 +65,11 @@ def do_pitch(audio_path: str) -> dict:
     duration = float(librosa.get_duration(y=y, sr=sr))
     hop_length = 512
 
-    # HPSS: 打楽器成分を除去し、ボーカルのような持続的な倍音成分を抽出する
-    # margin が高いほど分離が積極的になる（8 は強めの分離）
-    logger.info("HPSS でボーカル成分を分離中...")
-    y_harmonic = librosa.effects.harmonic(y, margin=8)
-    del y  # 元波形はもう不要
-
-    # 倍音成分だけで pYIN を実行 → ボーカルの音程を追跡
-    # fmin/fmax を人声の実用域（E2〜C6）に絞ることで楽器誤検出を減らす
-    f0, voiced_flag, voiced_probs = librosa.pyin(
-        y_harmonic,
+    # 人声の実用域（E2〜C6）に絞って pYIN を実行
+    # HPSS は使わない — ビブラートや滑らかなピッチ変化のあるボーカルが
+    # 「打楽器的」と誤判定されて消えてしまうため
+    f0, voiced_flag, _ = librosa.pyin(
+        y,
         fmin=librosa.note_to_hz("E2"),
         fmax=librosa.note_to_hz("C6"),
         sr=sr,
@@ -88,17 +83,16 @@ def do_pitch(audio_path: str) -> dict:
     def midi_note(m):
         return librosa.midi_to_note(int(round(max(0.0, min(127.0, m)))))
 
-    # voiced_probs > 0.5 かつ voiced_flag でフィルタ（pyin のデフォルトより少し厳しめ）
     raw_pitch = [
         {"t": round(float(t), 3), "midi": round(safe_midi(f), 2)}
-        for t, f, v, p in zip(times, f0, voiced_flag, voiced_probs)
-        if v and not np.isnan(f) and p > 0.5
+        for t, f, v in zip(times, f0, voiced_flag)
+        if v and not np.isnan(f)
     ]
 
     voiced_frames = [
         (i, float(times[i]), safe_midi(f0[i]))
         for i in range(len(times))
-        if voiced_flag[i] and not np.isnan(f0[i]) and voiced_probs[i] > 0.5
+        if voiced_flag[i] and not np.isnan(f0[i])
     ]
 
     segments = []
@@ -108,7 +102,7 @@ def do_pitch(audio_path: str) -> dict:
             if frame[0] - group[-1][0] <= 3:
                 group.append(frame)
             else:
-                if len(group) >= 3:
+                if len(group) >= 2:
                     midis = [f[2] for f in group]
                     m = float(np.median(midis))
                     segments.append({
@@ -118,7 +112,7 @@ def do_pitch(audio_path: str) -> dict:
                         "note":  midi_note(m),
                     })
                 group = [frame]
-        if len(group) >= 3:
+        if len(group) >= 2:
             midis = [f[2] for f in group]
             m = float(np.median(midis))
             segments.append({
@@ -131,7 +125,7 @@ def do_pitch(audio_path: str) -> dict:
     result = {"duration": duration, "segments": segments, "raw_pitch": raw_pitch}
 
     # 大きなarrayを明示的に解放してRAMを節約
-    del y_harmonic, f0, voiced_flag, voiced_probs, times, voiced_frames
+    del y, f0, voiced_flag, times, voiced_frames
     gc.collect()
 
     return result
