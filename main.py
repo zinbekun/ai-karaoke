@@ -6,13 +6,8 @@ import numpy as np
 import tempfile
 import os
 import gc
-import re
-import difflib
-import unicodedata
 import traceback
-from collections import defaultdict
 import logging
-import threading
 import asyncio
 
 logging.basicConfig(
@@ -36,23 +31,6 @@ app.add_middleware(
 
 MAX_FILE_SIZE = 100 * 1024 * 1024  # 100 MB
 MAX_DURATION  = 360  # 6 minutes
-
-WHISPER_MODEL = os.environ.get("WHISPER_MODEL", "small")
-
-_whisper_model = None
-_whisper_lock  = threading.Lock()
-
-
-def get_whisper_model():
-    global _whisper_model
-    with _whisper_lock:
-        if _whisper_model is None:
-            logger.info("Whisperモデルをロード中 [%s] (初回のみ)...", WHISPER_MODEL)
-            from faster_whisper import WhisperModel
-            _whisper_model = WhisperModel(WHISPER_MODEL, device="cpu", compute_type="int8")
-            logger.info("Whisperモデル ロード完了")
-    return _whisper_model
-
 
 def convert_to_wav(src: str) -> str:
     """ffmpegで任意フォーマットをWAVに変換"""
@@ -150,35 +128,6 @@ def do_pitch(audio_path: str) -> dict:
     return result
 
 
-def do_transcribe(audio_path: str) -> list:
-    """Whisperで歌詞を文字起こし"""
-    model = get_whisper_model()
-    segs, info = model.transcribe(
-        audio_path,
-        word_timestamps=True,
-        beam_size=3,
-        vad_filter=True,
-        vad_parameters={"min_silence_duration_ms": 500},
-    )
-    logger.info("Whisper言語検出: %s", info.language)
-
-    lyrics = []
-    for seg in segs:
-        words = []
-        if seg.words:
-            words = [
-                {"start": round(w.start, 3), "end": round(w.end, 3), "word": w.word}
-                for w in seg.words
-            ]
-        lyrics.append({
-            "start": round(seg.start, 3),
-            "end":   round(seg.end, 3),
-            "text":  seg.text.strip(),
-            "words": words,
-        })
-    return lyrics
-
-
 async def identify_song(audio_path: str) -> tuple:
     """Shazamで曲名・アーティスト名を認識"""
     try:
@@ -198,313 +147,9 @@ async def identify_song(audio_path: str) -> tuple:
     return None, None
 
 
-async def fetch_lyrics_ovh(artist: str, title: str):
-    """LyricsOVH APIから歌詞取得（主に英語）"""
-    try:
-        import httpx
-        from urllib.parse import quote
-        url = f"https://api.lyrics.ovh/v1/{quote(artist)}/{quote(title)}"
-        async with httpx.AsyncClient(timeout=10) as client:
-            r = await client.get(url)
-            if r.status_code == 200:
-                text = r.json().get("lyrics", "").strip()
-                if text:
-                    return text
-    except Exception as e:
-        logger.debug("LyricsOVH失敗: %s", e)
-    return None
-
-
-async def fetch_lyrics_genius(artist: str, title: str):
-    """Genius公開検索から歌詞取得（日本語を含む多言語）"""
-    try:
-        import httpx, html as html_mod
-        query = f"{artist} {title}"
-        headers = {
-            "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/120.0 Safari/537.36",
-        }
-        search_url = "https://genius.com/api/search/song"
-        async with httpx.AsyncClient(timeout=15, headers=headers, follow_redirects=True) as client:
-            sr = await client.get(search_url, params={"q": query})
-            if sr.status_code != 200:
-                return None
-            sections = sr.json().get("response", {}).get("sections", [])
-            hits = sections[0].get("hits", []) if sections else []
-            if not hits:
-                return None
-            song_url = hits[0].get("result", {}).get("url")
-            if not song_url:
-                return None
-
-            lr = await client.get(song_url)
-            if lr.status_code != 200:
-                return None
-
-            containers = re.findall(
-                r'<div data-lyrics-container="true"[^>]*>(.*?)</div>',
-                lr.text, re.DOTALL
-            )
-            if not containers:
-                return None
-
-            parts = []
-            for c in containers:
-                c = re.sub(r'<br\s*/?>', '\n', c, flags=re.IGNORECASE)
-                c = re.sub(r'<[^>]+>', '', c)
-                c = html_mod.unescape(c)
-                parts.append(c.strip())
-
-            lyrics = '\n'.join(parts).strip()
-            return lyrics if lyrics else None
-    except Exception as e:
-        logger.debug("Genius取得失敗: %s", e)
-    return None
-
-
-async def fetch_lyrics(artist: str, title: str):
-    """LyricsOVH → Genius の順で歌詞取得"""
-    lyrics = await fetch_lyrics_ovh(artist, title)
-    if lyrics:
-        logger.info("歌詞取得成功 (LyricsOVH): %d文字", len(lyrics))
-        return lyrics, "LyricsOVH"
-    lyrics = await fetch_lyrics_genius(artist, title)
-    if lyrics:
-        logger.info("歌詞取得成功 (Genius): %d文字", len(lyrics))
-        return lyrics, "Genius"
-    return None, None
 
 
 
-
-def _merge_segs(segs: list, gap: float = 1.5) -> list:
-    """Whisper セグメントの小さなギャップを結合してボーカル区間リストを返す"""
-    if not segs:
-        return []
-    out = [{'start': segs[0]['start'], 'end': segs[0]['end']}]
-    for s in segs[1:]:
-        if s['start'] - out[-1]['end'] <= gap:
-            out[-1]['end'] = max(out[-1]['end'], s['end'])
-        else:
-            out.append({'start': s['start'], 'end': s['end']})
-    return out
-
-
-def _vt_to_abs(vt: float, voiced: list) -> float:
-    """ボーカル累積時間 → 絶対時間（ギャップをスキップして戻す）"""
-    rem = vt
-    for seg in voiced:
-        d = seg['end'] - seg['start']
-        if rem <= d:
-            return seg['start'] + rem
-        rem -= d
-    return (voiced[-1]['end'] + rem) if voiced else vt
-
-
-def _abs_to_vt(t: float, voiced: list) -> float:
-    """絶対時間 → ボーカル累積時間（ギャップの時間を除外）"""
-    vt = 0.0
-    for seg in voiced:
-        if t <= seg['start']:
-            break
-        if t >= seg['end']:
-            vt += seg['end'] - seg['start']
-        else:
-            vt += t - seg['start']
-    return vt
-
-
-def _uniform_segments(lines: list, t0: float, t1: float) -> list:
-    """均等時間分配フォールバック（ボーカル情報なし時）"""
-    n    = len(lines)
-    span = max(t1 - t0, 1.0)
-    out  = []
-    for i, line in enumerate(lines):
-        ts       = t0 + i       * span / n
-        te       = t0 + (i + 1) * span / n
-        words    = line.split()
-        nw       = len(words)
-        wd       = (te - ts) / nw if nw else (te - ts)
-        out.append({
-            'start': round(ts, 3),
-            'end':   round(te, 3),
-            'text':  line,
-            'words': [
-                {'start': round(ts + wi * wd, 3),
-                 'end':   round(ts + (wi+1) * wd, 3),
-                 'word':  (' ' + w) if wi > 0 else w}
-                for wi, w in enumerate(words)
-            ],
-        })
-    return out
-
-
-
-
-
-def align_lyrics(fetched_text: str, whisper_segments: list, audio_duration: float = 0.0) -> list:
-    """
-    2フェーズ設計:
-      Phase1: vocal_uniform で安定ベースラインを確立（高速切替/フリーズなし保証）
-      Phase2: セグメントマッチで精度向上（圧縮を生まないアンカーのみ採用）
-    """
-    if not whisper_segments:
-        return whisper_segments
-
-    fetched_lines = []
-    for line in fetched_text.replace('\r\n', '\n').replace('\r', '\n').split('\n'):
-        line = line.strip()
-        if not line or re.match(r'^[\[【（(].+[\]】）)]$', line):
-            continue
-        fetched_lines.append(line)
-    if not fetched_lines:
-        return whisper_segments
-
-    song_start  = whisper_segments[0]['start']
-    whisper_end = whisper_segments[-1]['end']
-    if audio_duration > 0 and whisper_end < audio_duration * 0.80:
-        song_end = audio_duration * 0.88
-        logger.info("アライメント: 終端補正 %.1f→%.1f秒", whisper_end, song_end)
-    else:
-        song_end = whisper_end
-
-    voiced      = _merge_segs(whisper_segments, gap=2.0)
-    total_vocal = sum(s['end'] - s['start'] for s in voiced)
-    n_lines     = len(fetched_lines)
-
-    if total_vocal <= 0:
-        return _uniform_segments(fetched_lines, song_start, song_end)
-
-    ideal_vt = total_vocal / n_lines   # 1行あたりの理想ボーカル時間
-
-    def norm_text(s: str) -> str:
-        return re.sub(r'[^\w]', '', unicodedata.normalize('NFKC', s), flags=re.UNICODE).lower()
-
-    def make_words(line: str, t_s: float, t_e: float) -> list:
-        words = line.split()
-        nw = len(words)
-        wd = (t_e - t_s) / nw if nw > 0 else max(t_e - t_s, 0.3)
-        return [
-            {'start': round(t_s + wi * wd, 3),
-             'end':   round(t_s + (wi + 1) * wd, 3),
-             'word':  (' ' + w) if wi > 0 else w}
-            for wi, w in enumerate(words)
-        ]
-
-    def vt_to_seg(li: int) -> float:
-        """行インデックス → ボーカル累積時間（vocal_uniform 位置）"""
-        return li * ideal_vt
-
-    # ── Phase 1: vocal_uniform ベースライン ──────────────────────────────
-    # ベースラインは常に正しく（圧縮なし・フリーズなし）
-    base = []
-    for i in range(n_lines):
-        vts = i * ideal_vt
-        vte = (i + 1) * ideal_vt
-        base.append((_vt_to_abs(vts, voiced), _vt_to_abs(vte, voiced)))
-
-    # ── Phase 2: セグメントマッチングで精度向上 ───────────────────────────
-    seg_norms  = [norm_text(seg['text']) for seg in whisper_segments]
-    line_norms = [norm_text(line) for line in fetched_lines]
-
-    # 前向き貪欲マッチング（類似度閾値 0.4 以上）
-    raw_matches: dict = {}   # li → (t_s, t_e)
-    last_si = -1
-    for li, ln in enumerate(line_norms):
-        if not ln:
-            continue
-        best_score, best_si = 0.4, -1
-        for si in range(last_si + 1, len(whisper_segments)):
-            sn = seg_norms[si]
-            if not sn:
-                continue
-            score = difflib.SequenceMatcher(None, sn, ln).ratio()
-            if score > best_score:
-                best_score, best_si = score, si
-        if best_si >= 0:
-            last_si = best_si
-            seg = whisper_segments[best_si]
-            raw_matches[li] = (round(seg['start'], 3), round(seg['end'], 3))
-
-    # アンカーフィルタ: 中間行に十分なボーカル時間がないアンカーを除外
-    # （圧縮を防ぎ、高速切替の根本原因を排除）
-    anchors: list = []   # [(li, vt_start, vt_end)]
-    prev_li      = -1
-    prev_vt_end  = 0.0
-
-    for li in sorted(raw_matches):
-        t_s, t_e = raw_matches[li]
-        vt_s = _abs_to_vt(t_s, voiced)
-        n_between = li - prev_li - 1        # このアンカーまでの中間行数
-        vt_needed = n_between * ideal_vt    # 中間行に必要なボーカル時間
-        if vt_s - prev_vt_end >= vt_needed:
-            anchors.append((li, vt_s, _abs_to_vt(t_e, voiced)))
-            prev_li     = li
-            prev_vt_end = _abs_to_vt(t_e, voiced)
-
-    logger.info("アライメント: マッチ %d→フィルタ後 %d / %d行",
-                len(raw_matches), len(anchors), n_lines)
-
-    if not anchors:
-        # マッチなし → ベースライン（vocal_uniform）をそのまま返す
-        result = []
-        for li, line in enumerate(fetched_lines):
-            t_s, t_e = base[li]
-            result.append({'start': round(t_s, 3), 'end': round(t_e, 3),
-                           'text': line, 'words': make_words(line, t_s, t_e)})
-        return result
-
-    # ── ゾーン補間: アンカー境界にボーカル時間を等分配 ────────────────────
-    # 境界アンカー（ li=-1, vt=0 ）と（ li=n_lines, vt=total_vocal ）を追加
-    bounds = [(-1, 0.0, 0.0)] + anchors + [(n_lines, total_vocal, total_vocal)]
-
-    all_timing: dict = {}
-
-    for k in range(len(bounds) - 1):
-        a_li, _, a_vt_e = bounds[k]
-        b_li, b_vt_s, b_vt_e = bounds[k + 1]
-
-        # このゾーンの中間行
-        zone_lis = list(range(a_li + 1, b_li))
-        n_zone   = len(zone_lis)
-
-        if n_zone > 0:
-            vt_avail = max(0.0, b_vt_s - a_vt_e)
-            # アンカー間ゾーンはフィルタにより vt_avail >= n_zone * ideal_vt が保証済み
-            # 末尾ゾーンのみ不足する可能性があるため最低 0.5 * ideal_vt を保証
-            vt_pl = max(vt_avail / n_zone, ideal_vt * 0.5)
-            for i, li in enumerate(zone_lis):
-                vt = a_vt_e + i * vt_pl
-                all_timing[li] = (
-                    round(_vt_to_abs(vt, voiced), 3),
-                    round(_vt_to_abs(vt + vt_pl, voiced), 3),
-                )
-
-        # アンカー行自体（b_li が n_lines の境界アンカーでなければ）
-        if 0 <= b_li < n_lines:
-            t_s, t_e = raw_matches[b_li]
-            all_timing[b_li] = (t_s, t_e)
-
-    # ── 結果を構築 ────────────────────────────────────────────────────────
-    result = []
-    anchor_lis = {a[0] for a in anchors}
-    for li, line in enumerate(fetched_lines):
-        if li in all_timing:
-            t_s, t_e = all_timing[li]
-        else:
-            t_s, t_e = base[li]   # フォールバック（通常は到達しない）
-        result.append({
-            'start': round(t_s, 3),
-            'end':   round(t_e, 3),
-            'text':  line,
-            'words': make_words(line, t_s, t_e),
-        })
-
-    # 単調増加を保証（安全弁）
-    for i in range(1, len(result)):
-        if result[i]['start'] <= result[i - 1]['start']:
-            result[i]['start'] = round(result[i - 1]['start'] + ideal_vt * 0.5, 3)
-
-    return result
 
 
 @app.post("/api/analyze")
@@ -529,46 +174,26 @@ async def analyze_audio(file: UploadFile = File(...)):
         logger.info("音程解析中...")
         pitch_data = do_pitch(tmp_path)
 
-        # Step 2: 曲名認識 & 歌詞取得（軽量・非同期）
-        title, artist, fetched_lyrics, lyrics_source = None, None, None, None
+        # Step 2: 曲名認識（表示用）
+        title, artist = None, None
         try:
             title, artist = await identify_song(tmp_path)
             if title:
                 logger.info("曲名認識: %s - %s", artist, title)
-                fetched_lyrics, lyrics_source = await fetch_lyrics(artist or "", title)
             else:
-                logger.info("曲名認識失敗（Whisper歌詞のみ使用）")
+                logger.info("曲名認識失敗")
         except Exception as e:
-            logger.warning("曲名/歌詞取得エラー: %s", e)
+            logger.warning("曲名取得エラー: %s", e)
 
-        # Step 3: Whisper文字起こし
-        logger.info("歌詞文字起こし中...")
-        try:
-            lyrics = do_transcribe(tmp_path)
-            logger.info("歌詞セグメント数: %d", len(lyrics))
-        except Exception as e:
-            logger.warning("歌詞文字起こし失敗 (スキップ): %s", e)
-            lyrics = []
-        gc.collect()
-
-        # Step 4: 歌詞アライメント（ネット歌詞 + Whisperタイミング）
-        if fetched_lyrics and lyrics:
-            try:
-                lyrics = align_lyrics(fetched_lyrics, lyrics, pitch_data['duration'])
-            except Exception as e:
-                logger.warning("アライメント失敗（Whisper歌詞を使用）: %s", e)
-                lyrics_source = None
-
-        logger.info("解析完了: duration=%.1fs, pitch_segs=%d, lyrics=%d",
-                    pitch_data["duration"], len(pitch_data["segments"]), len(lyrics))
+        logger.info("解析完了: duration=%.1fs, pitch_segs=%d",
+                    pitch_data["duration"], len(pitch_data["segments"]))
 
         return {
-            "filename":     file.filename,
-            "duration":     pitch_data["duration"],
-            "segments":     pitch_data["segments"],
-            "raw_pitch":    pitch_data["raw_pitch"],
-            "lyrics":       lyrics,
-            "song_info":    {"title": title, "artist": artist, "source": lyrics_source} if title else None,
+            "filename":  file.filename,
+            "duration":  pitch_data["duration"],
+            "segments":  pitch_data["segments"],
+            "raw_pitch": pitch_data["raw_pitch"],
+            "song_info": {"title": title, "artist": artist} if title else None,
         }
 
     except Exception as e:

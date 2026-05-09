@@ -21,9 +21,6 @@ const PTS_GOOD    = 7;
 let analysisData   = null;
 let audioBlob      = null;
 
-// Lyrics state
-let lyricCurrIdx   = -1;  // currently active lyrics segment index
-
 let isPlaying      = false;
 let isMicActive    = false;
 let currentMidi    = null;   // user's live pitch
@@ -70,13 +67,6 @@ const evalText     = document.getElementById('eval-text');
 const accuracyNum  = document.getElementById('accuracy-num');
 const micNoteEl    = document.getElementById('mic-note');
 const targetNoteEl = document.getElementById('target-note');
-
-const lyricsSec    = document.getElementById('lyrics-section');
-const lyricPrev    = document.getElementById('lyric-prev');
-const lyricCurr    = document.getElementById('lyric-curr');
-const lyricNext    = document.getElementById('lyric-next');
-const lyricNext2   = document.getElementById('lyric-next2');
-const lyricsNone   = document.getElementById('lyrics-none');
 
 // ── File handling ──────────────────────────────────────────────────────────
 dropZone.addEventListener('dragover', e => { e.preventDefault(); dropZone.classList.add('drag-over'); });
@@ -127,25 +117,6 @@ async function loadFile(file) {
   }
   noPitchWarn.classList.toggle('hidden', analysisData.segments.length > 0);
 
-  // 歌詞セクション初期化
-  const hasLyrics = analysisData.lyrics && analysisData.lyrics.length > 0;
-  lyricsSec.classList.remove('hidden');
-  lyricsNone.classList.toggle('hidden', hasLyrics);
-
-  // 歌詞ソースバッジ
-  const lyricsSourceEl = document.getElementById('lyrics-source');
-  if (lyricsSourceEl) {
-    if (analysisData.song_info && analysisData.song_info.source) {
-      lyricsSourceEl.textContent = 'ネット取得 (' + analysisData.song_info.source + ')';
-      lyricsSourceEl.className = 'lyrics-source-badge badge-net';
-    } else {
-      lyricsSourceEl.textContent = 'AI文字起こし';
-      lyricsSourceEl.className = 'lyrics-source-badge badge-ai';
-    }
-  }
-  lyricPrev.textContent = lyricCurr.textContent = '';
-  lyricNext.textContent = lyricNext2.textContent = '';
-
   resetState();
   resizeCanvas();
   startRenderLoop();
@@ -177,7 +148,6 @@ newSongBtn.addEventListener('click', () => {
   analysisData = null;
   karaokeSec.classList.add('hidden');
   newSongWrap.classList.add('hidden');
-  lyricsSec.classList.add('hidden');
   uploadSec.classList.remove('hidden');
   fileInput.value = '';
 });
@@ -200,12 +170,9 @@ function resetState() {
   totalFrames = 0;
   hitFrames  = 0;
   lastEval   = '—';
-  lyricCurrIdx = -1;
   badges.length = 0;
   playBtn.textContent = '▶ 再生';
   updateHUD(null, null);
-  lyricPrev.textContent = lyricCurr.textContent = '';
-  lyricNext.textContent = lyricNext2.textContent = '';
 }
 
 // ── Microphone pitch detection ─────────────────────────────────────────────
@@ -349,8 +316,6 @@ function loop() {
 
   drawCanvas(t, target);
   updateHUD(target, currentMidi);
-
-  if (frameIdx % 2 === 0) updateLyrics(t);
 }
 
 // ── Scoring ────────────────────────────────────────────────────────────────
@@ -582,76 +547,6 @@ function createGrad(c, x1, x2, col1, col2) {
   g.addColorStop(0, col1);
   g.addColorStop(1, col2);
   return g;
-}
-
-// ── Lyrics update ──────────────────────────────────────────────────────────
-function updateLyrics(currentTime) {
-  const lyrics = analysisData && analysisData.lyrics;
-  if (!lyrics || lyrics.length === 0) return;
-
-  // 現在のセグメントを特定する。
-  // "end 時刻" ではなく "次の行の start 時刻" を切り替えの基準にすることで、
-  // end タイミングの誤差に依存しなくなる。
-  let newIdx = -(lyrics.length);  // 初期値: 全行がまだ先
-  for (let i = 0; i < lyrics.length; i++) {
-    if (currentTime < lyrics[i].start) {
-      newIdx = -(i + 1);  // i 番目がまだ先
-      break;
-    }
-    const nextStart = (i + 1 < lyrics.length) ? lyrics[i + 1].start : Infinity;
-    if (currentTime < nextStart) {
-      newIdx = i;          // 現在の行
-      break;
-    }
-  }
-
-  const segChanged = (newIdx !== lyricCurrIdx);
-
-  if (segChanged) {
-    lyricCurrIdx = newIdx;
-
-    if (newIdx >= 0) {
-      // 行が切り替わった: prev / next を更新
-      lyricPrev.textContent  = newIdx > 0                   ? lyrics[newIdx - 1].text : '';
-      lyricNext.textContent  = newIdx < lyrics.length - 1   ? lyrics[newIdx + 1].text : '';
-      lyricNext2.textContent = newIdx < lyrics.length - 2   ? lyrics[newIdx + 2].text : '';
-      // words なしの場合はここでテキストをセット
-      if (!lyrics[newIdx].words || lyrics[newIdx].words.length === 0) {
-        lyricCurr.textContent = lyrics[newIdx].text;
-      }
-    } else {
-      // 行間（無音区間）
-      const ni = -(newIdx + 1);
-      lyricPrev.textContent  = ni > 0                 ? lyrics[ni - 1].text : '';
-      lyricCurr.textContent  = '';
-      lyricNext.textContent  = ni < lyrics.length     ? lyrics[ni].text : '';
-      lyricNext2.textContent = ni < lyrics.length - 1 ? lyrics[ni + 1].text : '';
-    }
-  }
-
-  // 現在行の単語ハイライトを毎フレーム更新
-  if (newIdx >= 0) {
-    const seg = lyrics[newIdx];
-    if (seg.words && seg.words.length > 0) {
-      let html = '';
-      for (let wi = 0; wi < seg.words.length; wi++) {
-        const w         = seg.words[wi];
-        // 次の単語の start を "この単語が歌い終わった" 基準にする
-        const nextStart = wi + 1 < seg.words.length
-          ? seg.words[wi + 1].start
-          : (newIdx + 1 < lyrics.length ? lyrics[newIdx + 1].start : w.end);
-        const cls = currentTime >= nextStart  ? 'word-sung'
-                  : currentTime >= w.start    ? 'word-current'
-                  :                             'word-upcoming';
-        html += `<span class="${cls}">${escHtml(w.word)}</span>`;
-      }
-      lyricCurr.innerHTML = html;
-    }
-  }
-}
-
-function escHtml(s) {
-  return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
 }
 
 function roundRect2d(c, x, y, w, h, r) {
