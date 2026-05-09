@@ -65,13 +65,14 @@ def do_pitch(audio_path: str) -> dict:
     duration = float(librosa.get_duration(y=y, sr=sr))
     hop_length = 512
 
-    # 人声の実用域（E2〜C6）に絞って pYIN を実行
     # HPSS は使わない — ビブラートや滑らかなピッチ変化のあるボーカルが
     # 「打楽器的」と誤判定されて消えてしまうため
+    # fmin/fmax はキャンバス表示域（A2〜C7）を包むよう広めに設定する
+    # fmax を C6 に絞ると高音サビ・ファルセットが消えるため C7 まで確保
     f0, voiced_flag, _ = librosa.pyin(
         y,
-        fmin=librosa.note_to_hz("E2"),
-        fmax=librosa.note_to_hz("C6"),
+        fmin=librosa.note_to_hz("C2"),
+        fmax=librosa.note_to_hz("C7"),
         sr=sr,
         hop_length=hop_length,
     )

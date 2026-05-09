@@ -1,8 +1,8 @@
 'use strict';
 
 // ── Constants ──────────────────────────────────────────────────────────────
-const MIDI_MIN    = 45;   // A2  – lowest displayed pitch
-const MIDI_MAX    = 84;   // C6  – highest displayed pitch
+const MIDI_MIN    = 40;   // E2  – lowest displayed pitch
+const MIDI_MAX    = 96;   // C7  – highest displayed pitch
 const MIDI_RANGE  = MIDI_MAX - MIDI_MIN;
 const TIME_WINDOW = 9;    // seconds visible in canvas
 const NOW_RATIO   = 0.28; // current-time line at 28% from left
